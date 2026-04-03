@@ -15,18 +15,21 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import uuid
+from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
     import fcntl
 except ImportError:
     fcntl = None
-    try:
-        import msvcrt
-    except ImportError:
-        msvcrt = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -47,7 +50,17 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook", "bluebubbles",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    _linux_boot_id,
+    _linux_process_start_fingerprint,
+    claim_due_jobs,
+    clear_inflight_if_owned,
+    finalize_job_run,
+    mark_job_started,
+    recover_stale_inflight,
+    save_job_output,
+    update_delivery_error_if_latest,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -60,6 +73,142 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_JOB_LOCK_DIR = _LOCK_DIR / "locks"
+_INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+_EXECUTOR_LOCK = threading.Lock()
+_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_EXECUTOR_MAX_WORKERS = 0
+_ACTIVE_FUTURES: set[concurrent.futures.Future] = set()
+
+
+def _current_owner_metadata() -> dict:
+    pid = os.getpid()
+    return {
+        "owner_instance_id": _INSTANCE_ID,
+        "owner_pid": pid,
+        "owner_boot_id": _linux_boot_id(),
+        "owner_process_start": _linux_process_start_fingerprint(pid),
+    }
+
+
+def _try_acquire_lock_file(path: Path, *, non_blocking: bool) -> Optional[object]:
+    """Acquire a cross-platform file lock, returning an open file handle on success."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(path, "w")
+    try:
+        if fcntl:
+            mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_blocking else 0)
+            fcntl.flock(lock_fd, mode)
+            return lock_fd
+        if msvcrt:
+            mode = msvcrt.LK_NBLCK if non_blocking else msvcrt.LK_LOCK
+            msvcrt.locking(lock_fd.fileno(), mode, 1)
+            return lock_fd
+        # If no lock backend exists, proceed best-effort.
+        return lock_fd
+    except (OSError, IOError):
+        lock_fd.close()
+        return None
+
+
+def _release_lock_file(lock_fd: object) -> None:
+    try:
+        if fcntl:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        elif msvcrt:
+            try:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+    finally:
+        lock_fd.close()
+
+
+@contextmanager
+def _scheduler_lock(*, non_blocking: bool):
+    """Context manager for the short global scheduler metadata lock."""
+    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = _try_acquire_lock_file(_LOCK_FILE, non_blocking=non_blocking)
+    if lock_fd is None:
+        yield None
+        return
+    try:
+        yield lock_fd
+    finally:
+        _release_lock_file(lock_fd)
+
+
+def _try_acquire_job_lock(job_id: str) -> Optional[object]:
+    lock_path = _JOB_LOCK_DIR / f"job.{job_id}.lock"
+    return _try_acquire_lock_file(lock_path, non_blocking=True)
+
+
+def _cleanup_done_futures_locked() -> None:
+    done = [future for future in _ACTIVE_FUTURES if future.done()]
+    for future in done:
+        _ACTIVE_FUTURES.discard(future)
+        try:
+            future.result()
+        except Exception as e:
+            logger.error("Cron worker crashed: %s", e)
+
+
+def _active_worker_count() -> int:
+    with _EXECUTOR_LOCK:
+        _cleanup_done_futures_locked()
+        return len(_ACTIVE_FUTURES)
+
+
+def shutdown_worker_pool(*, wait: bool, cancel_futures: bool) -> None:
+    """Shut down the shared cron worker executor safely.
+
+    The executor reference is detached under the lock, then shut down outside the
+    lock so callers (including tests) do not risk deadlocking on thread teardown.
+    """
+    global _EXECUTOR, _EXECUTOR_MAX_WORKERS
+    executor = None
+    with _EXECUTOR_LOCK:
+        executor = _EXECUTOR
+        _EXECUTOR = None
+        _EXECUTOR_MAX_WORKERS = 0
+        _ACTIVE_FUTURES.clear()
+    if executor is not None:
+        executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+def _get_executor(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    global _EXECUTOR, _EXECUTOR_MAX_WORKERS
+    old = None
+    with _EXECUTOR_LOCK:
+        target_workers = max(1, int(max_workers))
+        if _EXECUTOR is None or _EXECUTOR_MAX_WORKERS != target_workers:
+            old = _EXECUTOR
+            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=target_workers,
+                thread_name_prefix="hermes-cron",
+            )
+            _EXECUTOR_MAX_WORKERS = target_workers
+        executor = _EXECUTOR
+    if old is not None:
+        old.shutdown(wait=False, cancel_futures=False)
+    return executor
+
+
+def _register_future(future: concurrent.futures.Future) -> None:
+    with _EXECUTOR_LOCK:
+        _cleanup_done_futures_locked()
+        _ACTIVE_FUTURES.add(future)
+
+
+def _resolve_max_parallel_jobs() -> int:
+    try:
+        cfg = load_config()
+        raw = cfg.get("cron", {}).get("max_parallel_jobs", 1)
+        value = int(raw)
+    except Exception:
+        value = 1
+    return max(1, value)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -809,96 +958,171 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+def _save_job_output(job: dict, output: str, verbose: bool) -> Path:
+    """Persist full cron output before finalizing run ownership.
+
+    Output durability matters more than delivery. Saving before finalization
+    avoids recording a run as complete while silently losing its output if the
+    filesystem write fails.
     """
-    Check and run all due jobs.
-    
-    Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
-    
+    output_file = save_job_output(job["id"], output)
+    if verbose:
+        logger.info("Output saved to: %s", output_file)
+    return output_file
+
+
+def _deliver_job_result(
+    job: dict,
+    success: bool,
+    final_response: str,
+    error: Optional[str],
+    *,
+    adapters=None,
+    loop=None,
+    run_at: Optional[str] = None,
+) -> None:
+    """Best-effort delivery of the final cron response.
+
+    Delivery happens only after the run has been durably finalized. Delivery
+    failures are recorded separately when the finalized run still matches the
+    provided ``run_at``.
+    """
+    deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+    should_deliver = bool(deliver_content)
+    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        should_deliver = False
+
+    delivery_error = None
+    if should_deliver:
+        try:
+            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+    if run_at is not None:
+        try:
+            update_delivery_error_if_latest(job["id"], run_at, delivery_error)
+        except Exception as exc:
+            logger.warning("Job '%s': failed to persist delivery status: %s", job["id"], exc)
+
+
+def _run_claimed_job(job: dict, verbose: bool, adapters=None, loop=None) -> bool:
+    """Run a previously claimed job with per-job non-overlap and run_id-safe finalization."""
+    job_id = job.get("id")
+    run_id = str((job.get("in_flight") or {}).get("run_id") or "")
+    if not job_id or not run_id:
+        logger.error("Skipping claimed job with missing id/run_id: %s", job)
+        return False
+
+    job_lock_fd = _try_acquire_job_lock(job_id)
+    if job_lock_fd is None:
+        reason = f"aborted: job execution lock busy for {job_id}"
+        logger.error("Job '%s' could not acquire per-job lock; clearing claim if still owned", job_id)
+        with _scheduler_lock(non_blocking=False):
+            clear_inflight_if_owned(job_id, run_id, reason=reason)
+        return False
+
+    try:
+        with _scheduler_lock(non_blocking=False):
+            started = mark_job_started(job_id, run_id, started_at=_hermes_now().isoformat())
+        if not started:
+            logger.warning("Job '%s' run_id=%s lost ownership before start; skipping", job_id, run_id)
+            return False
+
+        success, output, final_response, error = run_job(job)
+        _save_job_output(job, output, verbose)
+        finished_at = _hermes_now().isoformat()
+
+        with _scheduler_lock(non_blocking=False):
+            finalized = finalize_job_run(job_id, run_id, success, error, finished_at=finished_at)
+
+        if not finalized:
+            logger.warning(
+                "Discarding stale cron completion for job '%s' run_id=%s (ownership changed)",
+                job_id,
+                run_id,
+            )
+            return False
+
+        _deliver_job_result(job, success, final_response, error, adapters=adapters, loop=loop, run_at=finished_at)
+        return True
+
+    except Exception as e:
+        logger.error("Error processing claimed job %s: %s", job_id, e)
+        finished_at = _hermes_now().isoformat()
+        with _scheduler_lock(non_blocking=False):
+            finalize_job_run(job_id, run_id, False, str(e), finished_at=finished_at)
+        return False
+    finally:
+        _release_lock_file(job_lock_fd)
+
+
+def _dispatch_claimed_jobs(claimed_jobs: List[dict], max_parallel_jobs: int, verbose: bool, adapters=None, loop=None) -> int:
+    if not claimed_jobs:
+        return 0
+
+    executor = _get_executor(max_parallel_jobs)
+    submitted = 0
+    for job in claimed_jobs:
+        future = executor.submit(_run_claimed_job, job, verbose, adapters, loop)
+        _register_future(future)
+        submitted += 1
+    return submitted
+
+
+def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+    """Claim due jobs and dispatch execution workers.
+
+    Uses a short global metadata lock for stale recovery, claiming, and
+    run-state transitions. Job execution happens outside the global lock.
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
-    Returns:
-        Number of jobs executed (0 if another tick is already running)
-    """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
-    lock_fd = None
-    try:
-        lock_fd = open(_LOCK_FILE, "w")
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-    except (OSError, IOError):
-        logger.debug("Tick skipped — another instance holds the lock")
-        if lock_fd is not None:
-            lock_fd.close()
+    Returns:
+        Number of jobs dispatched (0 if none claimed or lock busy)
+    """
+    max_parallel_jobs = _resolve_max_parallel_jobs()
+    active_workers = _active_worker_count()
+    available_slots = max_parallel_jobs - active_workers
+    if available_slots <= 0:
+        logger.debug(
+            "Tick skipped — worker pool at capacity (%s/%s active)",
+            active_workers,
+            max_parallel_jobs,
+        )
         return 0
 
-    try:
-        due_jobs = get_due_jobs()
-
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+    with _scheduler_lock(non_blocking=True) as lock_fd:
+        if lock_fd is None:
+            logger.debug("Tick skipped — another instance holds the scheduler lock")
             return 0
 
+        now = _hermes_now()
+        recovered = recover_stale_inflight(now=now)
+        owner_metadata = _current_owner_metadata()
+        claimed_jobs = claim_due_jobs(
+            now=now,
+            max_parallel=available_slots,
+            **owner_metadata,
+        )
+
+    if recovered and verbose:
+        logger.info("%s - recovered %s stale in-flight run(s)", _hermes_now().strftime('%H:%M:%S'), recovered)
+
+    if not claimed_jobs:
         if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+        return 0
 
-        executed = 0
-        for job in due_jobs:
-            try:
-                # For recurring jobs (cron/interval), advance next_run_at to the
-                # next future occurrence BEFORE execution.  This way, if the
-                # process crashes mid-run, the job won't re-fire on restart.
-                # One-shot jobs are left alone so they can retry on restart.
-                advance_next_run(job["id"])
-
-                success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                executed += 1
-
-            except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
-
-        return executed
-    finally:
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
+    submitted = _dispatch_claimed_jobs(claimed_jobs, max_parallel_jobs, verbose, adapters=adapters, loop=loop)
+    if verbose:
+        logger.info("%s - dispatched %s job(s)", _hermes_now().strftime('%H:%M:%S'), submitted)
+    return submitted
 
 
 if __name__ == "__main__":

@@ -2,12 +2,60 @@
 
 import json
 import logging
+import multiprocessing
 import os
+import threading
+import time
+from contextlib import contextmanager
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+import cron.scheduler as scheduler
+from cron.jobs import claim_due_jobs, create_job, get_job, load_jobs, save_jobs
+from cron.scheduler import (
+    _build_job_prompt,
+    _deliver_result,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    run_job,
+    SILENT_MARKER,
+    tick,
+)
+
+
+@pytest.fixture()
+def cron_runtime(tmp_path, monkeypatch):
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr("cron.jobs.CRON_DIR", cron_dir)
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr("cron.scheduler._LOCK_DIR", cron_dir)
+    monkeypatch.setattr("cron.scheduler._LOCK_FILE", cron_dir / ".tick.lock")
+    monkeypatch.setattr("cron.scheduler._JOB_LOCK_DIR", cron_dir / "locks")
+
+    scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
+
+    yield cron_dir
+
+    scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
+
+
+def _wait_for_cron_workers(timeout_s: float = 2.5) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if scheduler._active_worker_count() == 0:
+            return
+        time.sleep(0.01)
+    raise AssertionError("Timed out waiting for cron workers to finish")
+
+
+@contextmanager
+def _noop_scheduler_lock(*, non_blocking: bool):
+    """Test helper: bypass scheduler file locking."""
+    yield object()
 
 
 class TestResolveOrigin:
@@ -944,35 +992,25 @@ class TestSilentDelivery:
         }
 
     def test_normal_response_delivers(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "Results here", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), True, "Results here", None)
         deliver_mock.assert_called_once()
 
     def test_silent_response_suppresses_delivery(self, caplog):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                scheduler._deliver_job_result(self._make_job(), True, "[SILENT]", None)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
     def test_silent_with_note_suppresses_delivery(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "[SILENT] No changes detected",
+                None,
+            )
         deliver_mock.assert_not_called()
 
     def test_silent_trailing_suppresses_delivery(self):
@@ -988,37 +1026,31 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "[silent] nothing new",
+                None,
+            )
         deliver_mock.assert_not_called()
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), False, "", "some error")
         deliver_mock.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
-             patch("cron.scheduler.save_job_output") as save_mock, \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+        with patch("cron.scheduler.save_job_output") as save_mock:
             save_mock.return_value = "/tmp/out.md"
-            from cron.scheduler import tick
-            tick(verbose=False)
+            result = scheduler._save_job_output(
+                self._make_job(),
+                "# full output",
+                verbose=False,
+            )
         save_mock.assert_called_once_with("monitor-job", "# full output")
-        deliver_mock.assert_not_called()
+        assert result == "/tmp/out.md"
 
 
 class TestBuildJobPromptSilentHint:
@@ -1092,42 +1124,348 @@ class TestBuildJobPromptMissingSkill:
         assert "go" in result
 
 
-class TestTickAdvanceBeforeRun:
-    """Verify that tick() calls advance_next_run before run_job for crash safety."""
+class TestParallelCronExecution:
+    def _set_due_now(self):
+        jobs = load_jobs()
+        due_at = (scheduler._hermes_now() - timedelta(minutes=1)).isoformat()
+        for job in jobs:
+            job["next_run_at"] = due_at
+        save_jobs(jobs)
 
-    def test_advance_called_before_run_job(self, tmp_path):
-        """advance_next_run must be called before run_job to prevent crash-loop re-fires."""
-        call_order = []
+    def test_cross_job_concurrency(self, cron_runtime, monkeypatch):
+        create_job(prompt="A", schedule="every 1h", name="job-a")
+        create_job(prompt="B", schedule="every 1h", name="job-b")
+        self._set_due_now()
 
-        def fake_advance(job_id):
-            call_order.append(("advance", job_id))
-            return True
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        running = 0
+        max_running = 0
+        lock = threading.Lock()
+        started = set()
+        both_started = threading.Event()
 
         def fake_run_job(job):
-            call_order.append(("run", job["id"]))
-            return True, "output", "response", None
+            nonlocal running, max_running
+            with lock:
+                running += 1
+                max_running = max(max_running, running)
+                started.add(job["id"])
+                if len(started) == 2:
+                    both_started.set()
+            both_started.wait(timeout=1.0)
+            time.sleep(0.05)
+            with lock:
+                running -= 1
+            return True, f"# output {job['id']}", f"done-{job['id']}", None
 
-        fake_job = {
-            "id": "test-advance",
-            "name": "test",
-            "prompt": "hello",
-            "enabled": True,
-            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        with patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            dispatched = tick(verbose=False)
+            assert dispatched == 2
+            _wait_for_cron_workers()
+
+        assert max_running >= 2, "expected different jobs to run concurrently"
+
+    def test_same_job_non_overlap(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="single", schedule="every 1h", name="job-single")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        started = threading.Event()
+        release = threading.Event()
+        run_count = 0
+
+        def fake_run_job(_job):
+            nonlocal run_count
+            run_count += 1
+            started.set()
+            release.wait(timeout=1.0)
+            return True, "# output", "done", None
+
+        with patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            first = tick(verbose=False)
+            assert first == 1
+            assert started.wait(timeout=1.0)
+
+            # Force due again while still running; in_flight ownership should prevent overlap.
+            jobs = load_jobs()
+            for rec in jobs:
+                if rec["id"] == job["id"]:
+                    rec["next_run_at"] = (scheduler._hermes_now() - timedelta(minutes=1)).isoformat()
+            save_jobs(jobs)
+
+            second = tick(verbose=False)
+            assert second == 0
+
+            release.set()
+            _wait_for_cron_workers()
+
+        assert run_count == 1
+
+    def test_per_job_lock_busy_clears_claim_without_counting_attempt(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="single", schedule="every 1h", name="job-single", repeat=1)
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=None), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler.run_job") as run_job_mock, \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler.finalize_job_run") as finalize_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed[0], verbose=False)
+
+        assert result is False
+        run_job_mock.assert_not_called()
+        save_mock.assert_not_called()
+        finalize_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "error"
+        assert "job execution lock busy" in (updated.get("last_error") or "")
+        assert updated.get("repeat", {}).get("completed") == 0
+        assert updated.get("enabled") is True
+        assert updated.get("state") == "scheduled"
+
+    def test_capacity_limited_ticks_dispatch_remaining_jobs_in_next_wave(self, cron_runtime, monkeypatch):
+        create_job(prompt="A", schedule="every 1h", name="job-a")
+        create_job(prompt="B", schedule="every 1h", name="job-b")
+        create_job(prompt="C", schedule="every 1h", name="job-c")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        invocation_count = 0
+        started_ids = []
+        first_wave_started = threading.Event()
+        release_first_wave = threading.Event()
+        lock = threading.Lock()
+
+        def fake_run_job(job):
+            nonlocal invocation_count
+            with lock:
+                invocation_count += 1
+                current = invocation_count
+                started_ids.append(job["id"])
+                if current >= 2:
+                    first_wave_started.set()
+            if current <= 2:
+                release_first_wave.wait(timeout=1.0)
+            return True, f"# output {job['id']}", f"done-{job['id']}", None
+
+        with patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            first = tick(verbose=False)
+            assert first == 2
+            assert first_wave_started.wait(timeout=1.0)
+
+            second = tick(verbose=False)
+            assert second == 0
+
+            release_first_wave.set()
+            _wait_for_cron_workers()
+
+            third = tick(verbose=False)
+            assert third == 1
+            _wait_for_cron_workers()
+
+        assert len(started_ids) == 3
+        assert len(set(started_ids)) == 3
+
+    def test_concurrent_ticks_do_not_double_dispatch_same_due_job(self, cron_runtime, monkeypatch):
+        create_job(prompt="solo", schedule="every 1h", name="job-solo")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        scheduler_gate = threading.Lock()
+        start_barrier = threading.Barrier(2)
+        started = threading.Event()
+        release = threading.Event()
+        run_count = 0
+        run_count_lock = threading.Lock()
+        tick_results = []
+
+        @contextmanager
+        def thread_scheduler_lock(*, non_blocking: bool):
+            acquired = scheduler_gate.acquire(blocking=not non_blocking)
+            if not acquired:
+                yield None
+                return
+            try:
+                yield object()
+            finally:
+                scheduler_gate.release()
+
+        def fake_run_job(_job):
+            nonlocal run_count
+            with run_count_lock:
+                run_count += 1
+            started.set()
+            release.wait(timeout=1.0)
+            return True, "# output", "done", None
+
+        def invoke_tick():
+            start_barrier.wait(timeout=1.0)
+            tick_results.append(tick(verbose=False))
+
+        with patch("cron.scheduler._scheduler_lock", side_effect=thread_scheduler_lock), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            t1 = threading.Thread(target=invoke_tick)
+            t2 = threading.Thread(target=invoke_tick)
+            t1.start()
+            t2.start()
+            assert started.wait(timeout=1.0)
+            release.set()
+            t1.join(timeout=1.0)
+            t2.join(timeout=1.0)
+            _wait_for_cron_workers()
+
+        assert sorted(tick_results) == [0, 1]
+        assert run_count == 1
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires fork-style multiprocessing for deterministic lock inheritance")
+    def test_separate_process_ticks_do_not_double_dispatch_same_due_job(self, cron_runtime, monkeypatch):
+        create_job(prompt="solo", schedule="every 1h", name="job-solo")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except ValueError:
+            pytest.skip("fork start method unavailable")
+
+        started_queue = ctx.Queue()
+        result_queue = ctx.Queue()
+        release = ctx.Event()
+
+        def fake_run_job(job):
+            started_queue.put(job["id"])
+            release.wait(timeout=1.0)
+            return True, f"# output {job['id']}", f"done-{job['id']}", None
+
+        def invoke_tick():
+            try:
+                result_queue.put(("ok", tick(verbose=False)))
+            except Exception as exc:  # pragma: no cover - defensive test plumbing
+                result_queue.put(("err", repr(exc)))
+
+        monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+        monkeypatch.setattr(scheduler, "save_job_output", lambda job_id, output: cron_runtime / f"{job_id}.md")
+        monkeypatch.setattr(scheduler, "_deliver_result", lambda job, content: None)
+
+        p1 = ctx.Process(target=invoke_tick)
+        p2 = ctx.Process(target=invoke_tick)
+        p1.start()
+        p2.start()
+
+        started_job_id = started_queue.get(timeout=2.0)
+        assert started_job_id
+        release.set()
+
+        results = [result_queue.get(timeout=2.0), result_queue.get(timeout=2.0)]
+        p1.join(timeout=2.0)
+        p2.join(timeout=2.0)
+        assert p1.exitcode == 0
+        assert p2.exitcode == 0
+
+        statuses = [status for status, _ in results]
+        assert statuses == ["ok", "ok"]
+        dispatched_counts = sorted(value for status, value in results if status == "ok")
+        assert dispatched_counts == [0, 1]
+
+    def test_stale_finalize_result_discarded(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
         }
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
-             patch("cron.scheduler.advance_next_run", side_effect=fake_advance) as adv_mock, \
-             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
-             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
-             patch("cron.scheduler.mark_job_run"), \
-             patch("cron.scheduler._deliver_result"):
-            from cron.scheduler import tick
-            executed = tick(verbose=False)
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.finalize_job_run", return_value=False) as finalize_mock, \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed, verbose=False)
 
-        assert executed == 1
-        adv_mock.assert_called_once_with("test-advance")
-        # advance must happen before run
-        assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
+        assert result is False
+        finalize_mock.assert_called_once()
+        save_mock.assert_called_once_with("job-1", "# output")
+        deliver_mock.assert_not_called()
+
+    def test_output_is_saved_before_finalize(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
+        }
+        call_order = []
+
+        def fake_save(job_id, output):
+            call_order.append(("save", job_id, output))
+            return "/tmp/out.md"
+
+        def fake_finalize(job_id, run_id, success, error, **kwargs):
+            call_order.append(("finalize", job_id, run_id, success, error))
+            return True
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=fake_save), \
+             patch("cron.scheduler.finalize_job_run", side_effect=fake_finalize), \
+             patch("cron.scheduler._deliver_result"):
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is True
+        assert call_order == [
+            ("save", "job-1", "# output"),
+            ("finalize", "job-1", "run-1", True, None),
+        ]
+
+    def test_save_failure_records_error_before_clearing_ownership(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
+        }
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=OSError("disk full")), \
+             patch("cron.scheduler.finalize_job_run", return_value=True) as finalize_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is False
+        finalize_mock.assert_called_once()
+        args = finalize_mock.call_args.args
+        assert args[:2] == ("job-1", "run-1")
+        assert args[2] is False
+        assert "disk full" in args[3]
+        deliver_mock.assert_not_called()
 
 
 class TestSendMediaViaAdapter:

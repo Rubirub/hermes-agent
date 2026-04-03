@@ -558,6 +558,8 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Maximum number of cron jobs this process may execute concurrently.
+        "max_parallel_jobs": 1,
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.

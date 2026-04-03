@@ -22,6 +22,8 @@ from cron.jobs import (
     mark_job_run,
     advance_next_run,
     get_due_jobs,
+    claim_due_jobs,
+    recover_stale_inflight,
     save_job_output,
 )
 
@@ -564,6 +566,55 @@ class TestGetDueJobs:
 
         assert get_due_jobs() == []
         assert get_job("oneshot-stale")["next_run_at"] is None
+
+
+class TestInFlightRecovery:
+    def test_stale_inflight_claim_is_recovered(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="Stale candidate", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (now - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        claimed = claim_due_jobs(now=now, owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        claimed_state = get_job(job["id"])
+        assert claimed_state is not None
+        assert claimed_state.get("in_flight")
+
+        timeout_at = datetime.fromisoformat(claimed_state["in_flight"]["timeout_at"])
+        recovered = recover_stale_inflight(now=timeout_at + timedelta(seconds=1))
+        assert recovered == 1
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "error"
+        assert updated.get("repeat", {}).get("completed") == 1
+        assert "stale_recovered" in (updated.get("last_error") or "")
+
+    def test_stale_recovery_respects_repeat_limit(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="Run once", schedule="every 1h", repeat=1)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (now - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        claimed = claim_due_jobs(now=now, owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        claimed_state = get_job(job["id"])
+        assert claimed_state is not None
+        timeout_at = datetime.fromisoformat(claimed_state["in_flight"]["timeout_at"])
+
+        recovered = recover_stale_inflight(now=timeout_at + timedelta(seconds=1))
+        assert recovered == 1
+        assert get_job(job["id"]) is None
 
 
 class TestSaveJobOutput:
