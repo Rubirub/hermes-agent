@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+IN_FLIGHT_TIMEOUT_GRACE_SECONDS = 5
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -313,6 +314,155 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     return None
 
 
+def _cron_timeout_seconds() -> float:
+    """Return configured cron timeout in seconds, clamped to a sane minimum."""
+    try:
+        timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
+    except (TypeError, ValueError):
+        timeout = 600.0
+    return max(timeout, 1.0)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(value))
+    except Exception:
+        return None
+
+
+def _find_job_index(jobs: List[Dict[str, Any]], job_id: str) -> Optional[int]:
+    for i, job in enumerate(jobs):
+        if job.get("id") == job_id:
+            return i
+    return None
+
+
+def _build_jobs_index(jobs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(job.get("id")): job for job in jobs if job.get("id")}
+
+
+def _apply_run_outcome(
+    job: Dict[str, Any],
+    *,
+    success: bool,
+    error: Optional[str],
+    run_at: str,
+    recompute_next_run: bool,
+) -> bool:
+    """Apply run outcome to a job in-place.
+
+    Returns True when the job should be removed (repeat limit reached).
+    """
+    job["last_run_at"] = run_at
+    job["last_status"] = "ok" if success else "error"
+    job["last_error"] = None if success else error
+
+    # Increment completed count for compatibility with existing semantics.
+    if job.get("repeat"):
+        job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+        times = job["repeat"].get("times")
+        completed = job["repeat"]["completed"]
+        if times is not None and times > 0 and completed >= times:
+            return True
+
+    schedule = job.get("schedule", {})
+    kind = schedule.get("kind")
+    if recompute_next_run:
+        next_run = compute_next_run(schedule, run_at)
+    elif kind == "once":
+        next_run = None
+    else:
+        # For recurring schedules, the claim step already advanced the slot.
+        next_run = job.get("next_run_at") or compute_next_run(schedule, run_at)
+
+    job["next_run_at"] = next_run
+    if next_run is None:
+        job["enabled"] = False
+        job["state"] = "completed"
+    elif job.get("state") != "paused":
+        job["state"] = "scheduled"
+
+    return False
+
+
+def _collect_due_jobs(
+    raw_jobs: List[Dict[str, Any]],
+    now: datetime,
+    *,
+    skip_in_flight: bool = True,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Collect due jobs from raw storage records.
+
+    Returns (due_jobs, needs_save), where needs_save indicates any recovered
+    one-shot next_run_at or fast-forwarded stale recurring schedule updates.
+    """
+    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    due: List[Dict[str, Any]] = []
+    needs_save = False
+    raw_by_id = _build_jobs_index(raw_jobs)
+
+    for job in jobs:
+        if not job.get("enabled", True):
+            continue
+        if skip_in_flight and job.get("in_flight"):
+            continue
+
+        next_run = job.get("next_run_at")
+        if not next_run:
+            recovered_next = _recoverable_oneshot_run_at(
+                job.get("schedule", {}),
+                now,
+                last_run_at=job.get("last_run_at"),
+            )
+            if not recovered_next:
+                continue
+
+            job["next_run_at"] = recovered_next
+            next_run = recovered_next
+            logger.info(
+                "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                job.get("name", job["id"]),
+                recovered_next,
+            )
+            raw = raw_by_id.get(job["id"])
+            if raw is not None:
+                raw["next_run_at"] = recovered_next
+                needs_save = True
+
+        next_run_dt = _parse_iso_datetime(next_run)
+        if not next_run_dt:
+            continue
+
+        if next_run_dt <= now:
+            schedule = job.get("schedule", {})
+            kind = schedule.get("kind")
+
+            # For recurring jobs, stale missed windows are fast-forwarded.
+            grace = _compute_grace_seconds(schedule)
+            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                new_next = compute_next_run(schedule, now.isoformat())
+                if new_next:
+                    logger.info(
+                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                        "Fast-forwarding to next run: %s",
+                        job.get("name", job["id"]),
+                        next_run,
+                        grace,
+                        new_next,
+                    )
+                    raw = raw_by_id.get(job["id"])
+                    if raw is not None:
+                        raw["next_run_at"] = new_next
+                        needs_save = True
+                    continue
+
+            due.append(job)
+
+    return due, needs_save
+
+
 # =============================================================================
 # Job CRUD Operations
 # =============================================================================
@@ -574,6 +724,203 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def recover_stale_inflight(now: Optional[datetime] = None) -> int:
+    """Recover stale in-flight runs whose timeout has expired.
+
+    Recovery is treated as a failed run attempt, so repeat accounting and final
+    job state must follow the same outcome rules as normal finalization.
+    """
+    now_dt = now or _hermes_now()
+    now_iso = now_dt.isoformat()
+    jobs = load_jobs()
+    recovered = 0
+    needs_save = False
+
+    for idx in range(len(jobs) - 1, -1, -1):
+        job = jobs[idx]
+        in_flight = job.get("in_flight")
+        if not isinstance(in_flight, dict):
+            continue
+
+        timeout_dt = _parse_iso_datetime(in_flight.get("timeout_at"))
+        if timeout_dt and timeout_dt > now_dt:
+            continue
+
+        run_id = in_flight.get("run_id", "unknown")
+        reason = f"stale_recovered: run_id={run_id}"
+        logger.warning(
+            "Recovering stale in-flight run for job '%s' (run_id=%s)",
+            job.get("id"),
+            run_id,
+        )
+
+        should_remove = _apply_run_outcome(
+            job,
+            success=False,
+            error=reason,
+            run_at=now_iso,
+            recompute_next_run=False,
+        )
+        job["in_flight"] = None
+
+        if should_remove:
+            jobs.pop(idx)
+        else:
+            jobs[idx] = job
+
+        recovered += 1
+        needs_save = True
+
+    if needs_save:
+        save_jobs(jobs)
+
+    return recovered
+
+
+def claim_due_jobs(
+    now: Optional[datetime] = None,
+    owner_instance_id: str = "",
+    max_parallel: int = 1,
+) -> List[Dict[str, Any]]:
+    """Claim due jobs by writing in_flight metadata and returning claimed jobs."""
+    now_dt = now or _hermes_now()
+    now_iso = now_dt.isoformat()
+    raw_jobs = load_jobs()
+    due_jobs, needs_save = _collect_due_jobs(raw_jobs, now_dt, skip_in_flight=True)
+    claimed: List[Dict[str, Any]] = []
+    raw_by_id = _build_jobs_index(raw_jobs)
+
+    try:
+        claim_budget = max(0, int(max_parallel))
+    except (TypeError, ValueError):
+        claim_budget = 1
+
+    if claim_budget <= 0:
+        if needs_save:
+            save_jobs(raw_jobs)
+        return []
+
+    timeout_at = (
+        now_dt
+        + timedelta(seconds=_cron_timeout_seconds() + IN_FLIGHT_TIMEOUT_GRACE_SECONDS)
+    ).isoformat()
+
+    for due in due_jobs:
+        if len(claimed) >= claim_budget:
+            break
+        raw = raw_by_id.get(due["id"])
+        if raw is None or raw.get("in_flight"):
+            continue
+
+        run_id = uuid.uuid4().hex
+        raw["in_flight"] = {
+            "run_id": run_id,
+            "owner_instance_id": owner_instance_id,
+            "claimed_at": now_iso,
+            "timeout_at": timeout_at,
+            "started_at": None,
+            "status": "claimed",
+        }
+
+        # Advance recurring schedules at claim time to preserve anti-double-fire semantics.
+        kind = raw.get("schedule", {}).get("kind")
+        if kind in ("cron", "interval"):
+            advanced_next = compute_next_run(raw["schedule"], now_iso)
+            if advanced_next:
+                raw["next_run_at"] = advanced_next
+
+        claimed.append(_apply_skill_fields(copy.deepcopy(raw)))
+        needs_save = True
+
+    if needs_save:
+        save_jobs(raw_jobs)
+
+    return claimed
+
+
+def mark_job_started(job_id: str, run_id: str, started_at: Optional[str] = None) -> bool:
+    """Mark an owned in-flight run as actively running."""
+    jobs = load_jobs()
+    idx = _find_job_index(jobs, job_id)
+    if idx is None:
+        return False
+
+    job = jobs[idx]
+    in_flight = job.get("in_flight")
+    if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+        return False
+
+    in_flight["started_at"] = started_at or _hermes_now().isoformat()
+    in_flight["status"] = "running"
+    job["in_flight"] = in_flight
+    save_jobs(jobs)
+    return True
+
+
+def clear_inflight_if_owned(job_id: str, run_id: str, reason: Optional[str] = None) -> bool:
+    """Clear in_flight only when the provided run_id still owns the claim."""
+    jobs = load_jobs()
+    idx = _find_job_index(jobs, job_id)
+    if idx is None:
+        return False
+
+    job = jobs[idx]
+    in_flight = job.get("in_flight")
+    if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+        return False
+
+    job["in_flight"] = None
+    if reason:
+        now_iso = _hermes_now().isoformat()
+        job["last_run_at"] = now_iso
+        job["last_status"] = "error"
+        job["last_error"] = reason
+        if job.get("schedule", {}).get("kind") == "once":
+            job["next_run_at"] = None
+            job["enabled"] = False
+            if job.get("state") != "paused":
+                job["state"] = "completed"
+
+    save_jobs(jobs)
+    return True
+
+
+def finalize_job_run(
+    job_id: str,
+    run_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    finished_at: Optional[str] = None,
+) -> bool:
+    """Finalize a run only when run_id still matches the stored in-flight owner."""
+    jobs = load_jobs()
+    idx = _find_job_index(jobs, job_id)
+    if idx is None:
+        return False
+
+    job = jobs[idx]
+    in_flight = job.get("in_flight")
+    if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+        return False
+
+    run_at = finished_at or _hermes_now().isoformat()
+    should_remove = _apply_run_outcome(
+        job,
+        success=success,
+        error=error,
+        run_at=run_at,
+        recompute_next_run=False,
+    )
+    job["in_flight"] = None
+
+    if should_remove:
+        jobs.pop(idx)
+    else:
+        jobs[idx] = job
+    save_jobs(jobs)
+    return True
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
     """
     Mark a job as having been run.
@@ -582,39 +929,25 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
     computes next_run_at, and auto-deletes if repeat limit reached.
     """
     jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] == job_id:
-            now = _hermes_now().isoformat()
-            job["last_run_at"] = now
-            job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
-            
-            # Increment completed count
-            if job.get("repeat"):
-                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                
-                # Check if we've hit the repeat limit
-                times = job["repeat"].get("times")
-                completed = job["repeat"]["completed"]
-                if times is not None and times > 0 and completed >= times:
-                    # Remove the job (limit reached)
-                    jobs.pop(i)
-                    save_jobs(jobs)
-                    return
-            
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
+    idx = _find_job_index(jobs, job_id)
+    if idx is None:
+        save_jobs(jobs)
+        return
 
-            # If no next run (one-shot completed), disable
-            if job["next_run_at"] is None:
-                job["enabled"] = False
-                job["state"] = "completed"
-            elif job.get("state") != "paused":
-                job["state"] = "scheduled"
+    job = jobs[idx]
+    run_at = _hermes_now().isoformat()
+    should_remove = _apply_run_outcome(
+        job,
+        success=success,
+        error=error,
+        run_at=run_at,
+        recompute_next_run=True,
+    )
 
-            save_jobs(jobs)
-            return
-    
+    if should_remove:
+        jobs.pop(idx)
+    else:
+        jobs[idx] = job
     save_jobs(jobs)
 
 
@@ -656,72 +989,9 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     """
     now = _hermes_now()
     raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
-    needs_save = False
-
-    for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            if not recovered_next:
-                continue
-
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
-                job.get("name", job["id"]),
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
-
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
-
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
-
-            due.append(job)
-
+    due, needs_save = _collect_due_jobs(raw_jobs, now, skip_in_flight=True)
     if needs_save:
         save_jobs(raw_jobs)
-
     return due
 
 
