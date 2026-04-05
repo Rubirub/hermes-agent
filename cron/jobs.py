@@ -462,7 +462,7 @@ def _get_inflight_owner_state(
     in_flight: Dict[str, Any],
     now_dt: Optional[datetime] = None,
 ) -> Tuple[str, str]:
-    del now_dt
+    del now_dt  # Reserved for future diagnostics; the decision is metadata-based today.
 
     owner_pid_raw = in_flight.get("owner_pid")
     owner_pid: Optional[int]
@@ -552,6 +552,17 @@ def _apply_run_outcome(
         job["state"] = "scheduled"
 
     return False
+
+
+def _restore_recoverable_next_run(job: Dict[str, Any], in_flight: Dict[str, Any], *, now_iso: str) -> None:
+    """Undo claim-time schedule advancement so a recovered recurring job is due again."""
+    kind = job.get("schedule", {}).get("kind")
+    if kind not in ("cron", "interval"):
+        return
+
+    claimed_at = in_flight.get("claimed_at")
+    recovered_due = claimed_at if _parse_iso_datetime(claimed_at) else now_iso
+    job["next_run_at"] = recovered_due
 
 
 def _collect_due_jobs(
