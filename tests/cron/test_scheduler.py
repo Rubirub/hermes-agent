@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -862,6 +862,160 @@ class TestParallelCronExecution:
 
         assert run_count == 1
 
+    def test_tick_recovers_orphan_and_dispatches_job(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="orphan", schedule="every 1h", name="job-orphan")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        monkeypatch.setattr(
+            "cron.jobs._get_inflight_owner_state",
+            lambda inflight, now_dt=None: ("dead", "owner pid not alive"),
+        )
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 0.0)
+
+        with patch("cron.scheduler.run_job", return_value=(True, "# output", "done", None)), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            dispatched = tick(verbose=False)
+            assert dispatched == 1
+            _wait_for_cron_workers()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "ok"
+
+    def test_tick_does_not_reclaim_when_owner_is_alive(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="alive", schedule="every 1h", name="job-alive")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+        original_run_id = get_job(job["id"])["in_flight"]["run_id"]
+
+        monkeypatch.setattr(
+            "cron.jobs._get_inflight_owner_state",
+            lambda inflight, now_dt=None: ("alive", "owner still alive"),
+        )
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 0.0)
+
+        with patch("cron.scheduler.run_job") as run_job_mock, \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            assert tick(verbose=False) == 0
+
+        run_job_mock.assert_not_called()
+        save_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight", {}).get("run_id") == original_run_id
+        assert updated.get("last_status") is None
+
+    def test_tick_waits_for_orphan_grace_before_reclaim(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="grace", schedule="every 1h", name="job-grace")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        monkeypatch.setattr(
+            "cron.jobs._get_inflight_owner_state",
+            lambda inflight, now_dt=None: ("dead", "owner pid not alive"),
+        )
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 60.0)
+
+        with patch("cron.scheduler.run_job") as run_job_mock, \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            assert tick(verbose=False) == 0
+
+        run_job_mock.assert_not_called()
+        save_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+        assert get_job(job["id"])["in_flight"] is not None
+
+        jobs = load_jobs()
+        jobs[0]["in_flight"]["claimed_at"] = (
+            datetime.fromisoformat(jobs[0]["in_flight"]["claimed_at"]) - timedelta(seconds=61)
+        ).isoformat()
+        save_jobs(jobs)
+
+        with patch("cron.scheduler.run_job", return_value=(True, "# output", "done", None)), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            assert tick(verbose=False) == 1
+            _wait_for_cron_workers()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "ok"
+
+    def test_legacy_orphaned_inflight_can_be_reclaimed_on_tick(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="legacy orphan", schedule="every 1h", name="job-legacy")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="43210-legacyaa", max_parallel=1)
+        assert len(claimed) == 1
+
+        jobs = load_jobs()
+        jobs[0]["in_flight"] = {
+            "run_id": jobs[0]["in_flight"]["run_id"],
+            "owner_instance_id": "43210-legacyaa",
+            "claimed_at": jobs[0]["in_flight"]["claimed_at"],
+            "timeout_at": jobs[0]["in_flight"]["timeout_at"],
+            "started_at": jobs[0]["in_flight"]["started_at"],
+            "status": jobs[0]["in_flight"]["status"],
+        }
+        save_jobs(jobs)
+
+        monkeypatch.setattr("cron.jobs._legacy_owner_pid_is_dead", lambda pid: True)
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 0.0)
+
+        with patch("cron.scheduler.run_job", return_value=(True, "# output", "done", None)), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            assert tick(verbose=False) == 1
+            _wait_for_cron_workers()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "ok"
+
+    def test_tick_recovers_mismatched_owner_and_dispatches_job(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="mismatch", schedule="every 1h", name="job-mismatch")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 1, "wrap_response": False}})
+
+        claimed = claim_due_jobs(now=scheduler._hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+
+        monkeypatch.setattr(
+            "cron.jobs._get_inflight_owner_state",
+            lambda inflight, now_dt=None: ("mismatch", "owner pid fingerprint mismatch"),
+        )
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 0.0)
+
+        with patch("cron.scheduler.run_job", return_value=(True, "# output", "done", None)), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            assert tick(verbose=False) == 1
+            _wait_for_cron_workers()
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated.get("last_status") == "ok"
+
     def test_per_job_lock_busy_clears_claim_without_counting_attempt(self, cron_runtime, monkeypatch):
         job = create_job(prompt="single", schedule="every 1h", name="job-single", repeat=1)
         self._set_due_now()
@@ -1062,6 +1216,28 @@ class TestParallelCronExecution:
         assert result is False
         finalize_mock.assert_called_once_with("job-1", "run-1", True, None)
         save_mock.assert_called_once_with("job-1", "# output")
+        deliver_mock.assert_not_called()
+
+    def test_old_owner_completion_is_discarded_after_ownership_change(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-old"},
+        }
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.save_job_output"), \
+             patch("cron.scheduler.finalize_job_run", return_value=False) as finalize_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is False
+        finalize_mock.assert_called_once_with("job-1", "run-old", True, None)
         deliver_mock.assert_not_called()
 
     def test_output_is_saved_before_finalize(self):

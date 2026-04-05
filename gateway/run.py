@@ -7041,8 +7041,30 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     
     # Stop cron ticker cleanly
+    try:
+        from cron.scheduler import _active_worker_count
+        active_cron_workers = _active_worker_count()
+    except Exception:
+        active_cron_workers = 0
+    if active_cron_workers:
+        logger.warning(
+            "Gateway shutdown requested with %d active cron worker(s); long-running cron jobs may be interrupted if the process is forced down",
+            active_cron_workers,
+        )
+
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    try:
+        from cron.scheduler import _active_worker_count
+        remaining_cron_workers = _active_worker_count()
+    except Exception:
+        remaining_cron_workers = 0
+    if remaining_cron_workers:
+        logger.warning(
+            "Gateway shutdown is proceeding with %d active cron worker(s) still running",
+            remaining_cron_workers,
+        )
 
     # Close MCP server connections
     try:

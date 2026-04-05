@@ -6,11 +6,13 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
 import copy
+import errno
 import json
 import logging
 import tempfile
 import os
 import re
+import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -323,6 +325,15 @@ def _cron_timeout_seconds() -> float:
     return max(timeout, 1.0)
 
 
+def _orphan_recovery_grace_seconds() -> float:
+    """Return the orphan-recovery grace window in seconds."""
+    try:
+        value = float(os.getenv("HERMES_CRON_ORPHAN_GRACE_SECONDS", 60))
+    except (TypeError, ValueError):
+        value = 60.0
+    return max(value, 0.0)
+
+
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -330,6 +341,160 @@ def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return _ensure_aware(datetime.fromisoformat(value))
     except Exception:
         return None
+
+
+def _parse_legacy_owner_pid(owner_instance_id: Optional[str]) -> Optional[int]:
+    if not owner_instance_id:
+        return None
+    match = re.match(r"^(\d+)-", str(owner_instance_id).strip())
+    if not match:
+        return None
+    try:
+        pid = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _linux_boot_id() -> Optional[str]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return value or None
+
+
+def _linux_process_state(pid: int) -> Optional[str]:
+    if not sys.platform.startswith("linux") or pid <= 0:
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    end_idx = stat_text.rfind(")")
+    if end_idx == -1 or len(stat_text) <= end_idx + 2:
+        return None
+    state = stat_text[end_idx + 2 : end_idx + 3]
+    return state or None
+
+
+def _linux_process_start_fingerprint(pid: int) -> Optional[str]:
+    if not sys.platform.startswith("linux") or pid <= 0:
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    end_idx = stat_text.rfind(")")
+    if end_idx == -1:
+        return None
+
+    fields = stat_text[end_idx + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    return fields[19] or None
+
+
+def _linux_pid_is_alive(pid: int) -> Optional[bool]:
+    if not sys.platform.startswith("linux") or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        alive = True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            alive = True
+        else:
+            return None
+    else:
+        alive = True
+
+    if alive:
+        state = _linux_process_state(pid)
+        if state in {"Z", "X", "x"}:
+            return False
+    return alive
+
+
+def _process_identity_matches(
+    pid: int,
+    *,
+    boot_id: Optional[str],
+    process_start: Optional[str],
+) -> Optional[bool]:
+    checked = False
+
+    if boot_id:
+        current_boot_id = _linux_boot_id()
+        if not current_boot_id:
+            return None
+        checked = True
+        if current_boot_id != boot_id:
+            return False
+
+    if process_start:
+        current_process_start = _linux_process_start_fingerprint(pid)
+        if not current_process_start:
+            return None
+        checked = True
+        if current_process_start != process_start:
+            return False
+
+    if checked and process_start:
+        return True
+    return None
+
+
+def _legacy_owner_pid_is_dead(pid: int) -> bool:
+    return _linux_pid_is_alive(pid) is False
+
+
+def _get_inflight_owner_state(
+    in_flight: Dict[str, Any],
+    now_dt: Optional[datetime] = None,
+) -> Tuple[str, str]:
+    del now_dt  # Reserved for future diagnostics; the decision is metadata-based today.
+
+    owner_pid_raw = in_flight.get("owner_pid")
+    owner_pid: Optional[int]
+    try:
+        owner_pid = int(owner_pid_raw) if owner_pid_raw is not None else None
+    except (TypeError, ValueError):
+        owner_pid = None
+
+    if owner_pid and owner_pid > 0:
+        alive = _linux_pid_is_alive(owner_pid)
+        if alive is False:
+            return "dead", f"owner pid {owner_pid} not alive"
+        if alive is True:
+            identity = _process_identity_matches(
+                owner_pid,
+                boot_id=in_flight.get("owner_boot_id"),
+                process_start=in_flight.get("owner_process_start"),
+            )
+            if identity is True:
+                return "alive", f"owner pid {owner_pid} alive and fingerprint matches"
+            if identity is False:
+                return "mismatch", f"owner pid {owner_pid} fingerprint mismatch"
+            return "unknown", f"owner pid {owner_pid} alive but identity could not be confirmed"
+        return "unknown", f"owner pid {owner_pid} liveness unavailable"
+
+    legacy_pid = _parse_legacy_owner_pid(in_flight.get("owner_instance_id"))
+    if legacy_pid is not None:
+        if _legacy_owner_pid_is_dead(legacy_pid):
+            return "dead", f"legacy owner pid {legacy_pid} not alive"
+        return "unknown", f"legacy owner pid {legacy_pid} could not be verified"
+
+    return "unknown", "owner metadata missing or unsupported"
 
 
 def _find_job_index(jobs: List[Dict[str, Any]], job_id: str) -> Optional[int]:
@@ -385,6 +550,17 @@ def _apply_run_outcome(
         job["state"] = "scheduled"
 
     return False
+
+
+def _restore_recoverable_next_run(job: Dict[str, Any], in_flight: Dict[str, Any], *, now_iso: str) -> None:
+    """Undo claim-time schedule advancement so a recovered recurring job is due again."""
+    kind = job.get("schedule", {}).get("kind")
+    if kind not in ("cron", "interval"):
+        return
+
+    claimed_at = in_flight.get("claimed_at")
+    recovered_due = claimed_at if _parse_iso_datetime(claimed_at) else now_iso
+    job["next_run_at"] = recovered_due
 
 
 def _collect_due_jobs(
@@ -743,17 +919,106 @@ def recover_stale_inflight(now: Optional[datetime] = None) -> int:
             continue
 
         timeout_dt = _parse_iso_datetime(in_flight.get("timeout_at"))
-        if timeout_dt and timeout_dt > now_dt:
-            continue
-
         run_id = in_flight.get("run_id", "unknown")
-        reason = f"stale_recovered: run_id={run_id}"
-        logger.warning(
-            "Recovering stale in-flight run for job '%s' (run_id=%s)",
-            job.get("id"),
-            run_id,
+
+        reason: Optional[str] = None
+        log_message: Optional[str] = None
+        owner_state = "unknown"
+        owner_reason = "owner state not evaluated"
+        claimed_at_dt = _parse_iso_datetime(in_flight.get("claimed_at"))
+        grace_seconds = _orphan_recovery_grace_seconds()
+        within_grace = (
+            claimed_at_dt is not None
+            and (now_dt - claimed_at_dt).total_seconds() < grace_seconds
         )
 
+        if timeout_dt is None:
+            owner_state, owner_reason = _get_inflight_owner_state(in_flight, now_dt=now_dt)
+            if owner_state in ("dead", "mismatch") and not within_grace:
+                reason = f"orphan_recovered: {owner_reason}; run_id={run_id}"
+                log_message = (
+                    "Recovering malformed orphaned in-flight run for job '%s' (run_id=%s): %s"
+                )
+            elif owner_state == "alive":
+                logger.warning(
+                    "Keeping malformed in-flight owner for job '%s' (run_id=%s): %s",
+                    job.get("id"),
+                    run_id,
+                    owner_reason,
+                )
+            elif owner_state == "unknown":
+                malformed_age_seconds = None
+                if claimed_at_dt is not None:
+                    malformed_age_seconds = (now_dt - claimed_at_dt).total_seconds()
+                malformed_stale = (
+                    claimed_at_dt is None
+                    or malformed_age_seconds is None
+                    or malformed_age_seconds >= (_cron_timeout_seconds() + grace_seconds)
+                )
+                if malformed_stale:
+                    reason = f"stale_recovered: invalid_timeout_at; run_id={run_id}"
+                    log_message = (
+                        "Recovering malformed in-flight run for job '%s' (run_id=%s): missing/invalid timeout_at"
+                    )
+                else:
+                    logger.warning(
+                        "Deferring malformed in-flight recovery for job '%s' (run_id=%s): %s",
+                        job.get("id"),
+                        run_id,
+                        owner_reason,
+                    )
+            elif within_grace:
+                logger.debug(
+                    "Malformed owner for job '%s' (run_id=%s) appears %s but remains within grace window",
+                    job.get("id"),
+                    run_id,
+                    owner_state,
+                )
+        elif timeout_dt <= now_dt:
+            reason = f"stale_recovered: run_id={run_id}"
+            log_message = (
+                "Recovering timed-out in-flight run for job '%s' (run_id=%s)"
+            )
+        else:
+            owner_state, owner_reason = _get_inflight_owner_state(in_flight, now_dt=now_dt)
+
+            if owner_state in ("dead", "mismatch") and not within_grace:
+                reason = f"orphan_recovered: {owner_reason}; run_id={run_id}"
+                log_message = (
+                    "Recovering orphaned in-flight run for job '%s' (run_id=%s): %s"
+                )
+            elif owner_state == "unknown":
+                logger.debug(
+                    "Deferring early recovery for job '%s' (run_id=%s): %s",
+                    job.get("id"),
+                    run_id,
+                    owner_reason,
+                )
+            elif owner_state == "alive":
+                logger.debug(
+                    "Keeping live in-flight owner for job '%s' (run_id=%s): %s",
+                    job.get("id"),
+                    run_id,
+                    owner_reason,
+                )
+            elif within_grace:
+                logger.debug(
+                    "Owner for job '%s' (run_id=%s) appears %s but remains within grace window",
+                    job.get("id"),
+                    run_id,
+                    owner_state,
+                )
+
+        if reason is None:
+            continue
+
+        if log_message:
+            if "%s" in log_message and log_message.count("%s") >= 3:
+                logger.warning(log_message, job.get("id"), run_id, reason)
+            else:
+                logger.warning(log_message, job.get("id"), run_id)
+
+        _restore_recoverable_next_run(job, in_flight, now_iso=now_iso)
         should_remove = _apply_run_outcome(
             job,
             success=False,
@@ -781,6 +1046,9 @@ def claim_due_jobs(
     now: Optional[datetime] = None,
     owner_instance_id: str = "",
     max_parallel: int = 1,
+    owner_pid: Optional[int] = None,
+    owner_boot_id: Optional[str] = None,
+    owner_process_start: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Claim due jobs by writing in_flight metadata and returning claimed jobs."""
     now_dt = now or _hermes_now()
@@ -800,6 +1068,14 @@ def claim_due_jobs(
             save_jobs(raw_jobs)
         return []
 
+    claim_owner_pid = owner_pid if owner_pid is not None else os.getpid()
+    if claim_owner_pid is not None and claim_owner_pid <= 0:
+        claim_owner_pid = None
+    claim_owner_boot_id = owner_boot_id if owner_boot_id is not None else _linux_boot_id()
+    claim_owner_process_start = owner_process_start
+    if claim_owner_process_start is None and claim_owner_pid is not None:
+        claim_owner_process_start = _linux_process_start_fingerprint(claim_owner_pid)
+
     timeout_at = (
         now_dt
         + timedelta(seconds=_cron_timeout_seconds() + IN_FLIGHT_TIMEOUT_GRACE_SECONDS)
@@ -816,6 +1092,9 @@ def claim_due_jobs(
         raw["in_flight"] = {
             "run_id": run_id,
             "owner_instance_id": owner_instance_id,
+            "owner_pid": claim_owner_pid,
+            "owner_boot_id": claim_owner_boot_id,
+            "owner_process_start": claim_owner_process_start,
             "claimed_at": now_iso,
             "timeout_at": timeout_at,
             "started_at": None,

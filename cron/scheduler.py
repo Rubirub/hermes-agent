@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
+    _linux_boot_id,
+    _linux_process_start_fingerprint,
     claim_due_jobs,
     clear_inflight_if_owned,
     finalize_job_run,
@@ -68,6 +70,16 @@ _EXECUTOR_LOCK = threading.Lock()
 _EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _EXECUTOR_MAX_WORKERS = 0
 _ACTIVE_FUTURES: set[concurrent.futures.Future] = set()
+
+
+def _current_owner_metadata() -> dict:
+    pid = os.getpid()
+    return {
+        "owner_instance_id": _INSTANCE_ID,
+        "owner_pid": pid,
+        "owner_boot_id": _linux_boot_id(),
+        "owner_process_start": _linux_process_start_fingerprint(pid),
+    }
 
 
 def _try_acquire_lock_file(path: Path, *, non_blocking: bool) -> Optional[object]:
@@ -890,10 +902,11 @@ def tick(verbose: bool = True) -> int:
 
         now = _hermes_now()
         recovered = recover_stale_inflight(now=now)
+        owner_metadata = _current_owner_metadata()
         claimed_jobs = claim_due_jobs(
             now=now,
-            owner_instance_id=_INSTANCE_ID,
             max_parallel=available_slots,
+            **owner_metadata,
         )
 
     if recovered and verbose:
