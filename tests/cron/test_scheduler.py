@@ -1047,6 +1047,32 @@ class TestSilentDelivery:
         save_mock.assert_called_once_with("monitor-job", "# full output")
         assert result == "/tmp/out.md"
 
+    def test_delivery_failure_is_recorded_for_latest_run(self):
+        with patch("cron.scheduler._deliver_result", return_value="telegram down") as deliver_mock, \
+             patch("cron.scheduler.update_delivery_error_if_latest") as update_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "Results here",
+                None,
+                run_at="2026-04-09T12:00:00+00:00",
+            )
+        deliver_mock.assert_called_once()
+        update_mock.assert_called_once_with("monitor-job", "2026-04-09T12:00:00+00:00", "telegram down")
+
+    def test_successful_delivery_clears_previous_delivery_error(self):
+        with patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.update_delivery_error_if_latest") as update_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "Results here",
+                None,
+                run_at="2026-04-09T12:00:00+00:00",
+            )
+        deliver_mock.assert_called_once()
+        update_mock.assert_called_once_with("monitor-job", "2026-04-09T12:00:00+00:00", None)
+
 
 class TestBuildJobPromptSilentHint:
     """Verify _build_job_prompt always injects [SILENT] guidance."""

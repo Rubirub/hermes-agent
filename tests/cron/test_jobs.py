@@ -25,6 +25,7 @@ from cron.jobs import (
     claim_due_jobs,
     recover_stale_inflight,
     save_job_output,
+    update_delivery_error_if_latest,
     _linux_pid_is_alive,
 )
 
@@ -373,6 +374,36 @@ class TestMarkJobRun:
         assert updated["last_delivery_error"] == "platform 'discord' not enabled"
 
 
+class TestDeliveryStatusUpdates:
+    def test_update_delivery_error_if_latest_updates_matching_run(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error=None)
+        latest = get_job(job["id"])
+        run_at = latest["last_run_at"]
+
+        updated = update_delivery_error_if_latest(job["id"], run_at, "telegram down")
+        assert updated is True
+
+        latest = get_job(job["id"])
+        assert latest["last_delivery_error"] == "telegram down"
+
+    def test_update_delivery_error_if_latest_rejects_stale_run(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error=None)
+        first_run_at = get_job(job["id"])["last_run_at"]
+
+        mark_job_run(job["id"], success=True, delivery_error="current failure")
+        latest = get_job(job["id"])
+        assert latest["last_delivery_error"] == "current failure"
+        assert latest["last_run_at"] != first_run_at
+
+        updated = update_delivery_error_if_latest(job["id"], first_run_at, "stale overwrite")
+        assert updated is False
+
+        latest = get_job(job["id"])
+        assert latest["last_delivery_error"] == "current failure"
+
+
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""
 
@@ -616,6 +647,30 @@ class TestInFlightRecovery:
         recovered = recover_stale_inflight(now=timeout_at + timedelta(seconds=1))
         assert recovered == 1
         assert get_job(job["id"]) is None
+
+    def test_timeout_recovery_restores_recurring_slot_to_claim_time(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="Restore slot", schedule="every 1h")
+        jobs = load_jobs()
+        original_due = (now - timedelta(minutes=5)).isoformat()
+        jobs[0]["next_run_at"] = original_due
+        save_jobs(jobs)
+
+        claimed = claim_due_jobs(now=now, owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+        claimed_at = claimed[0]["in_flight"]["claimed_at"]
+
+        claimed_state = get_job(job["id"])
+        timeout_at = datetime.fromisoformat(claimed_state["in_flight"]["timeout_at"])
+        recovered = recover_stale_inflight(now=timeout_at + timedelta(seconds=1))
+        assert recovered == 1
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated["next_run_at"] == claimed_at
 
 
 class TestOrphanedInFlightRecovery:
@@ -874,6 +929,40 @@ class TestOrphanedInFlightRecovery:
         recovered = recover_stale_inflight(now=now + timedelta(seconds=90))
         assert recovered == 1
         assert get_job(job["id"]) is None
+
+    def test_started_orphaned_recurring_job_is_recovered_and_requeued(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="Started orphan", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (now - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        claimed = claim_due_jobs(now=now, owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+        claimed_at = claimed[0]["in_flight"]["claimed_at"]
+
+        jobs = load_jobs()
+        jobs[0]["in_flight"]["status"] = "running"
+        jobs[0]["in_flight"]["started_at"] = (now + timedelta(seconds=5)).isoformat()
+        save_jobs(jobs)
+
+        monkeypatch.setattr(
+            "cron.jobs._get_inflight_owner_state",
+            lambda inflight, now_dt=None: ("dead", "owner pid not alive"),
+        )
+        monkeypatch.setattr("cron.jobs._orphan_recovery_grace_seconds", lambda: 30.0)
+
+        recovered = recover_stale_inflight(now=now + timedelta(seconds=90))
+        assert recovered == 1
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated.get("in_flight") is None
+        assert updated["next_run_at"] == claimed_at
+        assert updated["state"] == "scheduled"
+        assert "orphan_recovered" in (updated.get("last_error") or "")
 
 
 class TestOwnerLivenessHelpers:
