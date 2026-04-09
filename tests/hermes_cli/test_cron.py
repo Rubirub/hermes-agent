@@ -31,11 +31,23 @@ class TestCronCommandLifecycle:
         cron_command(Namespace(cron_command="run", job_id=job["id"]))
         triggered = get_job(job["id"])
         assert triggered["state"] == "scheduled"
+        assert triggered["enabled"] is True
+        assert triggered["trigger_once_at"] is not None
 
         out = capsys.readouterr().out
         assert "Paused job" in out
         assert "Resumed job" in out
         assert "Triggered job" in out
+
+    def test_run_keeps_paused_job_paused(self, tmp_cron_dir):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        cron_command(Namespace(cron_command="pause", job_id=job["id"]))
+
+        cron_command(Namespace(cron_command="run", job_id=job["id"]))
+        triggered = get_job(job["id"])
+        assert triggered["state"] == "paused"
+        assert triggered["enabled"] is False
+        assert triggered["trigger_once_at"] is not None
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(

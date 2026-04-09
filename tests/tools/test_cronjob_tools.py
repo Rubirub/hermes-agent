@@ -306,6 +306,36 @@ class TestUnifiedCronjobTool:
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
+    def test_run_once_keeps_paused_job_paused(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        job_id = created["job_id"]
+
+        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        assert paused["job"]["state"] == "paused"
+
+        triggered = json.loads(cronjob(action="run", job_id=job_id))
+        assert triggered["success"] is True
+        assert triggered["job"]["state"] == "paused"
+        assert triggered["job"]["trigger_once_at"] is not None
+
+    def test_list_surfaces_in_flight_status_for_triggered_paused_job(self):
+        from cron.jobs import claim_due_jobs, mark_job_started, _hermes_now
+
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        job_id = created["job_id"]
+        json.loads(cronjob(action="pause", job_id=job_id))
+        json.loads(cronjob(action="run", job_id=job_id))
+
+        claimed = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        run_id = claimed[0]["in_flight"]["run_id"]
+        assert mark_job_started(job_id, run_id, started_at=_hermes_now().isoformat()) is True
+
+        listing = json.loads(cronjob(action="list", include_disabled=True))
+        job = next(j for j in listing["jobs"] if j["job_id"] == job_id)
+        assert job["state"] == "paused"
+        assert job["in_flight_status"] == "running"
+        assert job["trigger_once_at"] is None
+
     def test_update_schedule_recomputes_display(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]

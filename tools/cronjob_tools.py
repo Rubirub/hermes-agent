@@ -180,6 +180,7 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = job.get("prompt", "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
+    in_flight = job.get("in_flight") if isinstance(job.get("in_flight"), dict) else None
     result = {
         "job_id": job["id"],
         "name": job["name"],
@@ -200,6 +201,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "trigger_once_at": job.get("trigger_once_at"),
+        "in_flight_status": in_flight.get("status") if in_flight else None,
     }
     if job.get("script"):
         result["script"] = job["script"]

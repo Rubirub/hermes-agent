@@ -582,9 +582,22 @@ def _collect_due_jobs(
     raw_by_id = _build_jobs_index(raw_jobs)
 
     for job in jobs:
-        if not job.get("enabled", True):
+        manual_trigger_at = job.get("trigger_once_at")
+        manual_trigger_dt = _parse_iso_datetime(manual_trigger_at) if manual_trigger_at else None
+        manual_trigger_due = manual_trigger_dt is not None and manual_trigger_dt <= now
+
+        if not job.get("enabled", True) and not manual_trigger_due:
             continue
         if skip_in_flight and job.get("in_flight"):
+            continue
+
+        if manual_trigger_due:
+            raw = raw_by_id.get(job["id"])
+            if raw is not None:
+                raw["trigger_once_at"] = None
+                needs_save = True
+            job["trigger_once_at"] = None
+            due.append(job)
             continue
 
         next_run = job.get("next_run_at")
@@ -876,18 +889,14 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick."""
+    """Trigger exactly one run on the next scheduler tick without changing pause/resume state."""
     job = get_job(job_id)
     if not job:
         return None
     return update_job(
         job_id,
         {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "trigger_once_at": _hermes_now().isoformat(),
         },
     )
 

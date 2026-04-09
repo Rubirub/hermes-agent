@@ -18,7 +18,10 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
+    mark_job_started,
+    finalize_job_run,
     mark_job_run,
     advance_next_run,
     get_due_jobs,
@@ -302,6 +305,101 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+
+    def test_trigger_job_keeps_paused_state(self, tmp_cron_dir):
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered is not None
+        assert triggered["enabled"] is False
+        assert triggered["state"] == "paused"
+        assert triggered["trigger_once_at"] is not None
+
+    def test_claim_due_jobs_includes_triggered_paused_job_without_unpausing(self, tmp_cron_dir):
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+        trigger_job(job["id"])
+
+        from cron.jobs import _hermes_now
+        claimed = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+
+        assert len(claimed) == 1
+        assert claimed[0]["id"] == job["id"]
+        assert claimed[0]["state"] == "paused"
+        assert claimed[0]["enabled"] is False
+
+        persisted = get_job(job["id"])
+        assert persisted is not None
+        assert persisted["state"] == "paused"
+        assert persisted["enabled"] is False
+        assert persisted["trigger_once_at"] is None
+        assert persisted["in_flight"] is not None
+
+    def test_triggered_paused_job_shows_running_while_in_flight(self, tmp_cron_dir):
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+        trigger_job(job["id"])
+
+        from cron.jobs import _hermes_now
+        claimed = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+        run_id = claimed[0]["in_flight"]["run_id"]
+
+        assert mark_job_started(job["id"], run_id, started_at=_hermes_now().isoformat()) is True
+
+        running = get_job(job["id"])
+        assert running is not None
+        assert running["state"] == "paused"
+        assert running["enabled"] is False
+        assert running["in_flight"] is not None
+        assert running["in_flight"]["status"] == "running"
+
+    def test_triggered_paused_job_finishes_and_remains_paused(self, tmp_cron_dir):
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+        trigger_job(job["id"])
+
+        from cron.jobs import _hermes_now
+        claimed = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(claimed) == 1
+        run_id = claimed[0]["in_flight"]["run_id"]
+        finished_at = _hermes_now().isoformat()
+
+        assert mark_job_started(job["id"], run_id, started_at=finished_at) is True
+        assert finalize_job_run(job["id"], run_id, True, finished_at=finished_at) is True
+
+        completed = get_job(job["id"])
+        assert completed is not None
+        assert completed["state"] == "paused"
+        assert completed["enabled"] is False
+        assert completed["in_flight"] is None
+        assert completed["last_status"] == "ok"
+        assert completed["last_run_at"] == finished_at
+        assert completed["next_run_at"] is not None
+
+    def test_triggered_paused_job_can_be_triggered_again_after_completion(self, tmp_cron_dir):
+        job = create_job(prompt="Trigger me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+
+        from cron.jobs import _hermes_now
+        trigger_job(job["id"])
+        first = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(first) == 1
+        first_run_id = first[0]["in_flight"]["run_id"]
+        first_finished_at = _hermes_now().isoformat()
+        assert mark_job_started(job["id"], first_run_id, started_at=first_finished_at) is True
+        assert finalize_job_run(job["id"], first_run_id, True, finished_at=first_finished_at) is True
+
+        trigger_job(job["id"])
+        second = claim_due_jobs(now=_hermes_now(), owner_instance_id="instance-a", max_parallel=1)
+        assert len(second) == 1
+        assert second[0]["id"] == job["id"]
+        assert second[0]["state"] == "paused"
+        assert second[0]["enabled"] is False
+        assert second[0]["in_flight"] is not None
+        assert second[0]["in_flight"]["run_id"] != first_run_id
 
 
 class TestMarkJobRun:
