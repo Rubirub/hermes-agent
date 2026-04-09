@@ -1016,13 +1016,8 @@ class TestSilentDelivery:
     def test_silent_trailing_suppresses_delivery(self):
         """Agent appended [SILENT] after explanation text — must still suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), True, response, None)
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
@@ -1581,7 +1576,10 @@ class TestParallelCronExecution:
             result = scheduler._run_claimed_job(claimed, verbose=False)
 
         assert result is False
-        finalize_mock.assert_called_once_with("job-1", "run-old", True, None)
+        finalize_mock.assert_called_once()
+        args = finalize_mock.call_args.args
+        assert args[:4] == ("job-1", "run-old", True, None)
+        assert "finished_at" in finalize_mock.call_args.kwargs
         deliver_mock.assert_not_called()
 
     def test_output_is_saved_before_finalize(self):
