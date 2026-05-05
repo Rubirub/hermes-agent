@@ -16,6 +16,9 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import uuid
+from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -108,7 +111,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    claim_due_jobs,
+    clear_inflight_if_owned,
+    finalize_job_run,
+    mark_job_started,
+    recover_stale_inflight,
+    save_job_output,
+    update_delivery_error_if_latest,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -121,6 +132,151 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_JOB_LOCK_DIR = _LOCK_DIR / "locks"
+_INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+_EXECUTOR_LOCK = threading.Lock()
+_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_EXECUTOR_MAX_WORKERS: Optional[int] = 0
+_ACTIVE_FUTURES: set[concurrent.futures.Future] = set()
+
+
+def _current_owner_metadata() -> dict:
+    pid = os.getpid()
+    return {
+        "owner_instance_id": _INSTANCE_ID,
+        "owner_pid": pid,
+    }
+
+
+def _try_acquire_lock_file(path: Path, *, non_blocking: bool) -> Optional[object]:
+    """Acquire a cross-platform file lock, returning an open file handle on success."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(path, "w")
+    try:
+        if fcntl:
+            mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_blocking else 0)
+            fcntl.flock(lock_fd, mode)
+            return lock_fd
+        if msvcrt:
+            mode = msvcrt.LK_NBLCK if non_blocking else msvcrt.LK_LOCK
+            msvcrt.locking(lock_fd.fileno(), mode, 1)
+            return lock_fd
+        return lock_fd
+    except (OSError, IOError):
+        lock_fd.close()
+        return None
+
+
+def _release_lock_file(lock_fd: object) -> None:
+    try:
+        if fcntl:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        elif msvcrt:
+            try:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+    finally:
+        lock_fd.close()
+
+
+@contextmanager
+def _scheduler_lock(*, non_blocking: bool):
+    """Context manager for the short global scheduler metadata lock."""
+    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = _try_acquire_lock_file(_LOCK_FILE, non_blocking=non_blocking)
+    if lock_fd is None:
+        yield None
+        return
+    try:
+        yield lock_fd
+    finally:
+        _release_lock_file(lock_fd)
+
+
+def _try_acquire_job_lock(job_id: str) -> Optional[object]:
+    return _try_acquire_lock_file(_JOB_LOCK_DIR / f"job.{job_id}.lock", non_blocking=True)
+
+
+def _cleanup_done_futures_locked() -> None:
+    done = [future for future in _ACTIVE_FUTURES if future.done()]
+    for future in done:
+        _ACTIVE_FUTURES.discard(future)
+        try:
+            future.result()
+        except Exception as e:
+            logger.error("Cron worker crashed: %s", e)
+
+
+def _active_worker_count() -> int:
+    with _EXECUTOR_LOCK:
+        _cleanup_done_futures_locked()
+        return len(_ACTIVE_FUTURES)
+
+
+def shutdown_worker_pool(*, wait: bool, cancel_futures: bool) -> None:
+    """Shut down the shared cron worker executor safely."""
+    global _EXECUTOR, _EXECUTOR_MAX_WORKERS
+    with _EXECUTOR_LOCK:
+        executor = _EXECUTOR
+        _EXECUTOR = None
+        _EXECUTOR_MAX_WORKERS = 0
+        _ACTIVE_FUTURES.clear()
+    if executor is not None:
+        executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+def _get_executor(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
+    global _EXECUTOR, _EXECUTOR_MAX_WORKERS
+    old = None
+    with _EXECUTOR_LOCK:
+        target_workers = None if max_workers is None else max(1, int(max_workers))
+        if _EXECUTOR is None or _EXECUTOR_MAX_WORKERS != target_workers:
+            old = _EXECUTOR
+            if target_workers is None:
+                _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    thread_name_prefix="hermes-cron",
+                )
+            else:
+                _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=target_workers,
+                    thread_name_prefix="hermes-cron",
+                )
+            _EXECUTOR_MAX_WORKERS = target_workers
+        executor = _EXECUTOR
+    if old is not None:
+        old.shutdown(wait=False, cancel_futures=False)
+    return executor
+
+
+def _register_future(future: concurrent.futures.Future) -> None:
+    with _EXECUTOR_LOCK:
+        _cleanup_done_futures_locked()
+        _ACTIVE_FUTURES.add(future)
+
+
+def _resolve_max_parallel_jobs() -> Optional[int]:
+    """Resolve max parallel workers: env var > config.yaml > unbounded."""
+    raw = None
+    env_value = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+    if env_value:
+        raw = env_value
+    else:
+        try:
+            cfg = load_config() or {}
+            cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+            raw = cron_cfg.get("max_parallel_jobs")
+        except Exception:
+            raw = None
+
+    if raw in (None, "", 0, "0"):
+        return None
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron.max_parallel_jobs value %r; defaulting to unbounded", raw)
+        return None
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -732,8 +888,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                     f"{prompt}"
                 )
             else:
-                # Script produced no output — nothing to report, skip AI call.
-                return None
+                prompt = (
+                    "[Script ran successfully but produced no output.]\n\n"
+                    f"{prompt}"
+                )
         else:
             prompt = (
                 "## Script Error\n"
@@ -1030,20 +1188,50 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import set_session_vars, clear_session_vars
 
     _ctx_tokens = set_session_vars(
         platform=origin["platform"] if origin else "",
         chat_id=str(origin["chat_id"]) if origin else "",
         chat_name=origin.get("chat_name", "") if origin else "",
     )
-    _cron_delivery_vars = (
-        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
-        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
-        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
-    )
-    for _var_name in _cron_delivery_vars:
-        _VAR_MAP[_var_name].set("")
+    _fallback_cron_env: dict[str, Optional[str]] = {}
+
+    def _set_job_context_env(name: str, value: str) -> None:
+        """Set a per-job context var, falling back to env for hot-upgrade safety.
+
+        A long-lived gateway can already have imported an older
+        gateway.session_context module whose _VAR_MAP lacks newer cron
+        auto-delivery keys. Prefer ContextVars when present; if the running
+        module is older, temporarily use os.environ and restore it in finally.
+        """
+        from gateway import session_context as _session_context
+
+        var = getattr(_session_context, "_VAR_MAP", {}).get(name)
+        if var is not None:
+            var.set(value)
+            return
+
+        if name not in _fallback_cron_env:
+            _fallback_cron_env[name] = os.environ.get(name)
+        os.environ[name] = value
+
+    def _clear_job_context_envs(*names: str) -> None:
+        from gateway import session_context as _session_context
+
+        for name in names:
+            var = getattr(_session_context, "_VAR_MAP", {}).get(name)
+            if var is not None:
+                var.set("")
+                continue
+            if name in _fallback_cron_env:
+                previous = _fallback_cron_env[name]
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+            else:
+                os.environ.pop(name, None)
 
     # Per-job working directory.  When set, expose it through a ContextVar-backed
     # TERMINAL_CWD helper so context discovery and tools see the job cwd without
@@ -1063,14 +1251,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
+        _cron_delivery_env_names = (
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        )
+        _clear_job_context_envs(*_cron_delivery_env_names)
+
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
-                ""
-                if delivery_target.get("thread_id") is None
-                else str(delivery_target["thread_id"])
+            _set_job_context_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", delivery_target["platform"])
+            _set_job_context_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", str(delivery_target["chat_id"]))
+            _set_job_context_env(
+                "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+                str(delivery_target["thread_id"]) if delivery_target.get("thread_id") is not None else "",
             )
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
@@ -1386,9 +1580,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # using their own context-local workdirs in sibling threads.
         _terminal_cwd_token.__exit__(None, None, None)
         # Clean up ContextVar session/delivery state for this job.
+        _clear_job_context_envs(
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        )
         clear_session_vars(_ctx_tokens)
-        for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
         if _session_db:
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")
@@ -1418,12 +1615,130 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _save_job_output(job: dict, output: str, verbose: bool) -> Path:
+    """Persist full cron output before finalizing run ownership."""
+    output_file = save_job_output(job["id"], output)
+    if verbose:
+        logger.info("Output saved to: %s", output_file)
+    return output_file
+
+
+def _deliver_job_result(
+    job: dict,
+    success: bool,
+    final_response: str,
+    error: Optional[str],
+    *,
+    adapters=None,
+    loop=None,
+    run_at: Optional[str] = None,
+) -> None:
+    """Best-effort delivery of the final cron response."""
+    deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+    should_deliver = bool(deliver_content)
+    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        should_deliver = False
+
+    delivery_error = None
+    if should_deliver:
+        try:
+            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+    if run_at is not None:
+        try:
+            update_delivery_error_if_latest(job["id"], run_at, delivery_error)
+        except Exception as exc:
+            logger.warning("Job '%s': failed to persist delivery status: %s", job["id"], exc)
+
+
+def _run_claimed_job(job: dict, verbose: bool, adapters=None, loop=None) -> bool:
+    """Run a previously claimed job with per-job non-overlap and run_id-safe finalization."""
+    job_id = job.get("id")
+    run_id = str((job.get("in_flight") or {}).get("run_id") or "")
+    if not job_id or not run_id:
+        logger.error("Skipping claimed job with missing id/run_id: %s", job)
+        return False
+
+    job_lock_fd = _try_acquire_job_lock(job_id)
+    if job_lock_fd is None:
+        reason = f"aborted: job execution lock busy for {job_id}"
+        logger.error("Job '%s' could not acquire per-job lock; clearing claim if still owned", job_id)
+        with _scheduler_lock(non_blocking=False):
+            clear_inflight_if_owned(job_id, run_id, reason=reason)
+        return False
+
+    try:
+        with _scheduler_lock(non_blocking=False):
+            started = mark_job_started(job_id, run_id, started_at=_hermes_now().isoformat())
+        if not started:
+            logger.warning("Job '%s' run_id=%s lost ownership before start; skipping", job_id, run_id)
+            return False
+
+        success, output, final_response, error = run_job(job)
+
+        if success and not final_response:
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        _save_job_output(job, output, verbose)
+        finished_at = _hermes_now().isoformat()
+
+        with _scheduler_lock(non_blocking=False):
+            finalized = finalize_job_run(job_id, run_id, success, error, finished_at=finished_at)
+
+        if not finalized:
+            logger.warning(
+                "Discarding stale cron completion for job '%s' run_id=%s (ownership changed)",
+                job_id,
+                run_id,
+            )
+            return False
+
+        _deliver_job_result(job, success, final_response, error, adapters=adapters, loop=loop, run_at=finished_at)
+        return True
+
+    except Exception as e:
+        logger.error("Error processing claimed job %s: %s", job_id, e)
+        finished_at = _hermes_now().isoformat()
+        with _scheduler_lock(non_blocking=False):
+            finalize_job_run(job_id, run_id, False, str(e), finished_at=finished_at)
+        return False
+    finally:
+        _release_lock_file(job_lock_fd)
+
+
+def _dispatch_claimed_jobs(
+    claimed_jobs: List[dict],
+    max_parallel_jobs: Optional[int],
+    verbose: bool,
+    adapters=None,
+    loop=None,
+) -> int:
+    if not claimed_jobs:
+        return 0
+
+    # All jobs, including workdir jobs, are parallel-safe. run_job exposes
+    # per-job workdir through a ContextVar-backed TERMINAL_CWD helper rather
+    # than mutating process-global os.environ.
+    executor = _get_executor(max_parallel_jobs)
+    submitted = 0
+    for job in claimed_jobs:
+        _ctx = contextvars.copy_context()
+        future = executor.submit(_ctx.run, _run_claimed_job, job, verbose, adapters, loop)
+        _register_future(future)
+        submitted += 1
+    return submitted
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
-    """
-    Check and run all due jobs.
-    
-    Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
+    """Claim due jobs and dispatch execution workers.
+
+    Uses a short global metadata lock for stale recovery, claiming, and
+    run-state transitions. Job execution happens outside the global lock.
     
     Args:
         verbose: Whether to print status messages
@@ -1431,144 +1746,56 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         loop: Optional asyncio event loop (from gateway) for live adapter sends
     
     Returns:
-        Number of jobs executed (0 if another tick is already running)
+        Number of jobs dispatched (0 if none claimed or lock busy)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    configured_max_parallel = _resolve_max_parallel_jobs()
+    active_workers = _active_worker_count()
 
-    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
-    lock_fd = None
-    try:
-        lock_fd = open(_LOCK_FILE, "w")
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-    except (OSError, IOError):
-        logger.debug("Tick skipped — another instance holds the lock")
-        if lock_fd is not None:
-            lock_fd.close()
-        return 0
-
-    try:
-        due_jobs = get_due_jobs()
-
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+    if configured_max_parallel is None:
+        available_slots = 1_000_000
+        executor_workers = None
+    else:
+        available_slots = configured_max_parallel - active_workers
+        executor_workers = configured_max_parallel
+        if available_slots <= 0:
+            logger.debug(
+                "Tick skipped — worker pool at capacity (%s/%s active)",
+                active_workers,
+                configured_max_parallel,
+            )
             return 0
 
+    with _scheduler_lock(non_blocking=True) as lock_fd:
+        if lock_fd is None:
+            logger.debug("Tick skipped — another instance holds the scheduler lock")
+            return 0
+
+        now = _hermes_now()
+        recovered = recover_stale_inflight(now=now)
+        owner_metadata = _current_owner_metadata()
+        claimed_jobs = claim_due_jobs(
+            now=now,
+            max_parallel=available_slots,
+            **owner_metadata,
+        )
+
+    if recovered and verbose:
+        logger.info("%s - recovered %s stale in-flight run(s)", _hermes_now().strftime('%H:%M:%S'), recovered)
+
+    if not claimed_jobs:
         if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
-
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        for job in due_jobs:
-            advance_next_run(job["id"])
-
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
-        # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
-        _max_workers: Optional[int] = None
-        try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
-            if _env_par:
-                _max_workers = int(_env_par) or None
-        except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
-            try:
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
-                if _cfg_par is not None:
-                    _max_workers = int(_cfg_par) or None
-            except Exception:
-                pass
-
-        if verbose:
-            logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
-                len(due_jobs),
-                _max_workers if _max_workers else "unbounded",
-            )
-
-        def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end: execute, save, deliver, mark."""
-            _job_workdir = (job.get("workdir") or "").strip() or None
-            if _job_workdir and not Path(_job_workdir).is_dir():
-                _job_workdir = None
-            with terminal_cwd(_job_workdir):
-                try:
-                    success, output, final_response, error = run_job(job)
-
-                    output_file = save_job_output(job["id"], output)
-                    if verbose:
-                        logger.info("Output saved to: %s", output_file)
-
-                    # Deliver the final response to the origin/target chat.
-                    # If the agent responded with [SILENT], skip delivery (but
-                    # output is already saved above).  Failed jobs always deliver.
-                    deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                    should_deliver = bool(deliver_content)
-                    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                        should_deliver = False
-
-                    delivery_error = None
-                    if should_deliver:
-                        try:
-                            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                        except Exception as de:
-                            delivery_error = str(de)
-                            logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                    # Treat empty final_response as a soft failure so last_status
-                    # is not "ok" — the agent ran but produced nothing useful.
-                    # (issue #8585)
-                    if success and not final_response:
-                        success = False
-                        error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                    return True
-
-                except Exception as e:
-                    logger.error("Error processing job %s: %s", job['id'], e)
-                    mark_job_run(job["id"], False, str(e))
-                    return False
-
-        _results: list = []
-
-        # All jobs, including workdir jobs, are parallel-safe. run_job exposes
-        # per-job workdir through a ContextVar-backed TERMINAL_CWD helper rather
-        # than mutating process-global os.environ.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
-            _futures = []
-            for job in due_jobs:
-                _ctx = contextvars.copy_context()
-                _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-            _results.extend(f.result() for f in _futures)
-
-        # Best-effort sweep of MCP stdio subprocesses that survived their
-        # session teardown during this tick.  Runs AFTER every job has
-        # finished so active sessions (including live user chats) are
-        # never touched — only PIDs explicitly detected as orphans in
-        # tools.mcp_tool._run_stdio's finally block are reaped.
-        try:
-            from tools.mcp_tool import _kill_orphaned_mcp_children
-            _kill_orphaned_mcp_children()
-        except Exception as _e:
-            logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
-
-        return sum(_results)
-    finally:
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
+            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+        return 0
+    submitted = _dispatch_claimed_jobs(
+        claimed_jobs,
+        executor_workers,
+        verbose,
+        adapters=adapters,
+        loop=loop,
+    )
+    if verbose:
+        logger.info("%s - dispatched %s job(s)", _hermes_now().strftime('%H:%M:%S'), submitted)
+    return submitted
 
 
 if __name__ == "__main__":

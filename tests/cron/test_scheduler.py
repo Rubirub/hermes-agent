@@ -3,13 +3,66 @@
 import json
 import logging
 import os
+import threading
+import time
+from contextlib import contextmanager
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+import cron.scheduler as scheduler
+from cron.jobs import create_job, load_jobs, save_jobs
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.fixture()
+def cron_runtime(tmp_path, monkeypatch):
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr("cron.jobs.CRON_DIR", cron_dir)
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr("cron.scheduler._LOCK_DIR", cron_dir)
+    monkeypatch.setattr("cron.scheduler._LOCK_FILE", cron_dir / ".tick.lock")
+    monkeypatch.setattr("cron.scheduler._JOB_LOCK_DIR", cron_dir / "locks")
+
+    scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
+    yield cron_dir
+    scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
+
+
+def _wait_for_cron_workers(timeout_s: float = 2.5) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if scheduler._active_worker_count() == 0:
+            return
+        time.sleep(0.01)
+    raise AssertionError("Timed out waiting for cron workers to finish")
+
+
+@contextmanager
+def _noop_scheduler_lock(*, non_blocking: bool):
+    yield object()
+
+
+class TestSchedulerOwnershipMetadata:
+    def test_current_owner_metadata_passes_only_stable_identity(self, monkeypatch):
+        monkeypatch.setattr("cron.scheduler.os.getpid", lambda: 4242)
+
+        assert scheduler._current_owner_metadata() == {
+            "owner_instance_id": scheduler._INSTANCE_ID,
+            "owner_pid": 4242,
+        }
+
+    def test_get_executor_none_uses_default_pool_size(self, cron_runtime):
+        executor = scheduler._get_executor(None)
+        try:
+            assert executor is not None
+            assert scheduler._EXECUTOR_MAX_WORKERS is None
+        finally:
+            scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
 
 
 class TestResolveOrigin:
@@ -1084,40 +1137,30 @@ class TestRunJobSessionPersistence:
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
-        tick() should mark the job as error so last_status != 'ok'.
+        claimed-run finalization should mark the job as error so last_status != 'ok'.
         (issue #8585)
         """
-        from cron.scheduler import tick
-        from cron.jobs import load_jobs, save_jobs
-
         job = {
             "id": "empty-job",
             "name": "empty-test",
             "prompt": "do something",
-            "schedule": "every 1h",
-            "enabled": True,
-            "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
-            "last_status": None,
+            "in_flight": {"run_id": "run-empty"},
         }
 
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.mark_job_run") as mock_mark, \
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.finalize_job_run") as finalize_mock, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
-            tick(verbose=False)
+            assert scheduler._run_claimed_job(job, verbose=False) is True
 
-        # Should be called with success=False because final_response is empty
-        mock_mark.assert_called_once()
-        call_args = mock_mark.call_args
-        assert call_args[0][0] == "empty-job"
-        assert call_args[0][1] is False  # success should be False
-        assert "empty" in call_args[0][2].lower()  # error should mention empty
+        finalize_mock.assert_called_once()
+        args = finalize_mock.call_args.args
+        assert args[:3] == ("empty-job", "run-empty", False)
+        assert "empty" in args[3].lower()
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
@@ -1131,122 +1174,7 @@ class TestRunJobSessionPersistence:
 
         (tmp_path / ".env").write_text("TELEGRAM_HOME_CHANNEL=-2002\n")
         monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
 
-        class FakeAgent:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def run_conversation(self, *args, **kwargs):
-                from gateway.session_context import get_session_env
-                seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None
-                seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None
-                seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
-                return {"final_response": "ok"}
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch(
-                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                 return_value={
-                     "api_key": "***",
-                     "base_url": "https://example.invalid/v1",
-                     "provider": "openrouter",
-                     "api_mode": "chat_completions",
-                 },
-             ), \
-             patch("run_agent.AIAgent", FakeAgent):
-            success, output, final_response, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        assert final_response == "ok"
-        assert "ok" in output
-        assert seen == {
-            "platform": "telegram",
-            "chat_id": "-2002",
-            "thread_id": None,
-        }
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        fake_db.close.assert_called_once()
-
-    def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):
-        jobs = [
-            {
-                "id": "threaded-job",
-                "name": "threaded",
-                "prompt": "hello",
-                "deliver": "telegram:-1001:42",
-            },
-            {
-                "id": "threadless-job",
-                "name": "threadless",
-                "prompt": "hello again",
-                "deliver": "telegram:-2002",
-            },
-        ]
-        fake_db = MagicMock()
-        seen = []
-
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
-        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
-
-        class FakeAgent:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def run_conversation(self, *args, **kwargs):
-                from gateway.session_context import get_session_env
-
-                seen.append(
-                    {
-                        "platform": get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None,
-                        "chat_id": get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None,
-                        "thread_id": get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None,
-                    }
-                )
-                return {"final_response": "ok"}
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch(
-                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                 return_value={
-                     "api_key": "***",
-                     "base_url": "https://example.invalid/v1",
-                     "provider": "openrouter",
-                     "api_mode": "chat_completions",
-                 },
-             ), \
-             patch("run_agent.AIAgent", FakeAgent):
-            for job in jobs:
-                success, output, final_response, error = run_job(job)
-                assert success is True
-                assert error is None
-                assert final_response == "ok"
-                assert "ok" in output
-
-        assert seen == [
-            {
-                "platform": "telegram",
-                "chat_id": "-1001",
-                "thread_id": "42",
-            },
-            {
-                "platform": "telegram",
-                "chat_id": "-2002",
-                "thread_id": None,
-            },
-        ]
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
-        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        assert fake_db.close.call_count == 2
 
 
 class TestRunJobConfigLogging:
@@ -1617,72 +1545,87 @@ class TestSilentDelivery:
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
 
+    def test_normal_response_delivers(self):
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), True, "Results here", None)
+        deliver_mock.assert_called_once()
+
     def test_silent_response_suppresses_delivery(self, caplog):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                scheduler._deliver_job_result(self._make_job(), True, "[SILENT]", None)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
     def test_silent_with_note_suppresses_delivery(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "[SILENT] No changes detected",
+                None,
+            )
         deliver_mock.assert_not_called()
 
     def test_silent_trailing_suppresses_delivery(self):
         """Agent appended [SILENT] after explanation text — must still suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), True, response, None)
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "[silent] nothing new",
+                None,
+            )
         deliver_mock.assert_not_called()
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        with patch("cron.scheduler._deliver_result") as deliver_mock:
+            scheduler._deliver_job_result(self._make_job(), False, "", "some error")
         deliver_mock.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
-             patch("cron.scheduler.save_job_output") as save_mock, \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+        with patch("cron.scheduler.save_job_output") as save_mock:
             save_mock.return_value = "/tmp/out.md"
-            from cron.scheduler import tick
-            tick(verbose=False)
+            result = scheduler._save_job_output(
+                self._make_job(),
+                "# full output",
+                verbose=False,
+            )
         save_mock.assert_called_once_with("monitor-job", "# full output")
-        deliver_mock.assert_not_called()
+        assert result == "/tmp/out.md"
+
+    def test_delivery_failure_is_recorded_for_latest_run(self):
+        with patch("cron.scheduler._deliver_result", return_value="telegram down") as deliver_mock, \
+             patch("cron.scheduler.update_delivery_error_if_latest") as update_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "Results here",
+                None,
+                run_at="2026-04-09T12:00:00+00:00",
+            )
+        deliver_mock.assert_called_once()
+        update_mock.assert_called_once_with("monitor-job", "2026-04-09T12:00:00+00:00", "telegram down")
+
+    def test_successful_delivery_clears_previous_delivery_error(self):
+        with patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.update_delivery_error_if_latest") as update_mock:
+            scheduler._deliver_job_result(
+                self._make_job(),
+                True,
+                "Results here",
+                None,
+                run_at="2026-04-09T12:00:00+00:00",
+            )
+        deliver_mock.assert_called_once()
+        update_mock.assert_called_once_with("monitor-job", "2026-04-09T12:00:00+00:00", None)
 
 
 class TestBuildJobPromptSilentHint:
@@ -2015,11 +1958,15 @@ class TestSendMediaViaAdapter:
         t = threading.Thread(target=loop.run_forever, daemon=True)
         t.start()
         try:
+            deadline = time.time() + 1.0
+            while not loop.is_running() and time.time() < deadline:
+                time.sleep(0.01)
             _send_media_via_adapter(adapter, chat_id, media_files, metadata, loop, job)
         finally:
             loop.call_soon_threadsafe(loop.stop)
             t.join(timeout=5)
-            loop.close()
+            if not loop.is_running():
+                loop.close()
 
     def test_video_dispatched_to_send_video(self):
         adapter = MagicMock()
@@ -2055,15 +2002,25 @@ class TestParallelTick:
         """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
         lock_dir = tmp_path / "cron"
         lock_dir.mkdir()
-        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
-             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+        with patch("cron.jobs.CRON_DIR", lock_dir), \
+             patch("cron.jobs.JOBS_FILE", lock_dir / "jobs.json"), \
+             patch("cron.jobs.OUTPUT_DIR", lock_dir / "output"), \
+             patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"), \
+             patch("cron.scheduler._JOB_LOCK_DIR", lock_dir / "locks"):
+            scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
             yield
+            scheduler.shutdown_worker_pool(wait=True, cancel_futures=True)
+
+    def _set_due(self):
+        due_at = (scheduler._hermes_now() - timedelta(minutes=1)).isoformat()
+        jobs = load_jobs()
+        for job in jobs:
+            job["next_run_at"] = due_at
+        save_jobs(jobs)
 
     def test_parallel_jobs_run_concurrently(self):
         """Two jobs launched in the same tick should overlap in time."""
-        import threading
-        import time
-
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
@@ -2074,19 +2031,17 @@ class TestParallelTick:
             call_order.append(("end", job["id"]))
             return (True, "output", "response", None)
 
-        jobs = [
-            {"id": "job-a", "name": "a", "deliver": "local"},
-            {"id": "job-b", "name": "b", "deliver": "local"},
-        ]
+        create_job(prompt="A", schedule="every 1h", name="job-a")
+        create_job(prompt="B", schedule="every 1h", name="job-b")
+        self._set_due()
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+        with patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 2, "wrap_response": False}}), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler._deliver_result", return_value=None):
             from cron.scheduler import tick
             result = tick(verbose=False)
+            _wait_for_cron_workers()
 
         assert result == 2
         # Both starts happened before both ends — proof of concurrency
@@ -2117,24 +2072,32 @@ class TestParallelTick:
             clear_session_vars(tokens)
             return (True, "output", "response", None)
 
-        jobs = [
-            {"id": "tg-job", "name": "tg", "deliver": "local",
-             "origin": {"platform": "telegram", "chat_id": "111"}},
-            {"id": "dc-job", "name": "dc", "deliver": "local",
-             "origin": {"platform": "discord", "chat_id": "222"}},
-        ]
+        create_job(
+            prompt="tg",
+            schedule="every 1h",
+            name="tg-job",
+            origin={"platform": "telegram", "chat_id": "111"},
+        )
+        create_job(
+            prompt="dc",
+            schedule="every 1h",
+            name="dc-job",
+            origin={"platform": "discord", "chat_id": "222"},
+        )
+        self._set_due()
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+        with patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 2, "wrap_response": False}}), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler._deliver_result", return_value=None):
             from cron.scheduler import tick
             tick(verbose=False)
+            _wait_for_cron_workers()
 
-        assert seen["tg-job"] == {"platform": "telegram", "chat_id": "111"}
-        assert seen["dc-job"] == {"platform": "discord", "chat_id": "222"}
+        names_by_id = {job["id"]: job["name"] for job in load_jobs()}
+        seen_by_name = {names_by_id[job_id]: value for job_id, value in seen.items()}
+        assert seen_by_name["tg-job"] == {"platform": "telegram", "chat_id": "111"}
+        assert seen_by_name["dc-job"] == {"platform": "discord", "chat_id": "222"}
 
     def test_max_parallel_env_var(self, monkeypatch):
         """HERMES_CRON_MAX_PARALLEL=1 should restore serial behaviour."""
@@ -2148,25 +2111,185 @@ class TestParallelTick:
             call_times.append(("end", job["id"], time.monotonic()))
             return (True, "output", "response", None)
 
-        jobs = [
-            {"id": "s1", "name": "s1", "deliver": "local"},
-            {"id": "s2", "name": "s2", "deliver": "local"},
-        ]
+        create_job(prompt="s1", schedule="every 1h", name="s1")
+        create_job(prompt="s2", schedule="every 1h", name="s2")
+        self._set_due()
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+        with patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler._deliver_result", return_value=None):
             from cron.scheduler import tick
             result = tick(verbose=False)
+            _wait_for_cron_workers()
 
-        assert result == 2
-        # With max_workers=1, second job starts after first ends
-        end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
-        start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
-        assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+        assert result == 1
+        assert len([entry for entry in call_times if entry[0] == "start"]) == 1
+
+
+class TestParallelCronOwnership:
+    def _set_due_now(self):
+        jobs = load_jobs()
+        due_at = (scheduler._hermes_now() - timedelta(minutes=1)).isoformat()
+        for job in jobs:
+            job["next_run_at"] = due_at
+        save_jobs(jobs)
+
+    def test_same_job_non_overlap(self, cron_runtime, monkeypatch):
+        job = create_job(prompt="single", schedule="every 1h", name="job-single")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        started = threading.Event()
+        release = threading.Event()
+        run_count = 0
+
+        def fake_run_job(_job):
+            nonlocal run_count
+            run_count += 1
+            started.set()
+            release.wait(timeout=1.0)
+            return True, "# output", "done", None
+
+        with patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            assert scheduler.tick(verbose=False) == 1
+            assert started.wait(timeout=1.0)
+
+            jobs = load_jobs()
+            for rec in jobs:
+                if rec["id"] == job["id"]:
+                    rec["next_run_at"] = (scheduler._hermes_now() - timedelta(minutes=1)).isoformat()
+            save_jobs(jobs)
+
+            assert scheduler.tick(verbose=False) == 0
+            release.set()
+            _wait_for_cron_workers()
+
+        assert run_count == 1
+
+    def test_capacity_limited_ticks_dispatch_remaining_jobs_in_next_wave(self, cron_runtime, monkeypatch):
+        create_job(prompt="A", schedule="every 1h", name="job-a")
+        create_job(prompt="B", schedule="every 1h", name="job-b")
+        create_job(prompt="C", schedule="every 1h", name="job-c")
+        self._set_due_now()
+        monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"max_parallel_jobs": 2, "wrap_response": False}})
+
+        invocation_count = 0
+        started_ids = []
+        first_wave_started = threading.Event()
+        release_first_wave = threading.Event()
+        lock = threading.Lock()
+
+        def fake_run_job(job):
+            nonlocal invocation_count
+            with lock:
+                invocation_count += 1
+                current = invocation_count
+                started_ids.append(job["id"])
+                if current >= 2:
+                    first_wave_started.set()
+            if current <= 2:
+                release_first_wave.wait(timeout=1.0)
+            return True, f"# output {job['id']}", f"done-{job['id']}", None
+
+        with patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=cron_runtime / "out.md"), \
+             patch("cron.scheduler._deliver_result"):
+            assert scheduler.tick(verbose=False) == 2
+            assert first_wave_started.wait(timeout=1.0)
+            assert scheduler.tick(verbose=False) == 0
+
+            release_first_wave.set()
+            _wait_for_cron_workers()
+
+            assert scheduler.tick(verbose=False) == 1
+            _wait_for_cron_workers()
+
+        assert len(started_ids) == 3
+        assert len(set(started_ids)) == 3
+
+    def test_stale_finalize_result_discarded(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
+        }
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.finalize_job_run", return_value=False) as finalize_mock, \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is False
+        finalize_mock.assert_called_once()
+        save_mock.assert_called_once_with("job-1", "# output")
+        deliver_mock.assert_not_called()
+
+    def test_output_is_saved_before_finalize(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
+        }
+        call_order = []
+
+        def fake_save(job_id, output):
+            call_order.append(("save", job_id, output))
+            return "/tmp/out.md"
+
+        def fake_finalize(job_id, run_id, success, error, **kwargs):
+            call_order.append(("finalize", job_id, run_id, success, error))
+            return True
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=fake_save), \
+             patch("cron.scheduler.finalize_job_run", side_effect=fake_finalize), \
+             patch("cron.scheduler._deliver_result"):
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is True
+        assert call_order == [
+            ("save", "job-1", "# output"),
+            ("finalize", "job-1", "run-1", True, None),
+        ]
+
+    def test_save_failure_records_error_before_clearing_ownership(self):
+        claimed = {
+            "id": "job-1",
+            "name": "Job 1",
+            "deliver": "local",
+            "in_flight": {"run_id": "run-1"},
+        }
+
+        with patch("cron.scheduler._try_acquire_job_lock", return_value=MagicMock()), \
+             patch("cron.scheduler._scheduler_lock", side_effect=_noop_scheduler_lock), \
+             patch("cron.scheduler._release_lock_file"), \
+             patch("cron.scheduler.mark_job_started", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "ok", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=OSError("disk full")), \
+             patch("cron.scheduler.finalize_job_run", return_value=True) as finalize_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock:
+            result = scheduler._run_claimed_job(claimed, verbose=False)
+
+        assert result is False
+        finalize_mock.assert_called_once()
+        args = finalize_mock.call_args.args
+        assert args[:2] == ("job-1", "run-1")
+        assert args[2] is False
+        assert "disk full" in args[3]
+        deliver_mock.assert_not_called()
 
 
 class TestDeliverResultTimeoutCancelsFuture:

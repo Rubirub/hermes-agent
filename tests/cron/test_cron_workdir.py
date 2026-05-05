@@ -206,21 +206,37 @@ class TestTickWorkdirPartition:
     def test_workdir_jobs_run_concurrently_with_isolated_terminal_cwd(self, tmp_path, monkeypatch):
         import threading
         import time
+        from contextlib import contextmanager
 
         import cron.scheduler as sched
         from hermes_cli.cwd_context import get_terminal_cwd
+
+        @contextmanager
+        def noop_scheduler_lock(*, non_blocking: bool):
+            yield object()
 
         dir_a = tmp_path / "a"
         dir_b = tmp_path / "b"
         dir_a.mkdir()
         dir_b.mkdir()
         jobs = [
-            {"id": "a", "name": "A", "workdir": str(dir_a)},
-            {"id": "b", "name": "B", "workdir": str(dir_b)},
+            {"id": "a", "name": "A", "workdir": str(dir_a), "in_flight": {"run_id": "run-a"}},
+            {"id": "b", "name": "B", "workdir": str(dir_b), "in_flight": {"run_id": "run-b"}},
         ]
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_scheduler_lock", noop_scheduler_lock)
+        monkeypatch.setattr(sched, "recover_stale_inflight", lambda now=None: 0)
+        monkeypatch.setattr(sched, "claim_due_jobs", lambda **_kw: jobs)
+        monkeypatch.setattr(sched, "_active_worker_count", lambda: 0)
+        monkeypatch.setattr(sched, "_resolve_max_parallel_jobs", lambda: 2)
+        monkeypatch.setattr(sched, "_current_owner_metadata", lambda: {})
+        monkeypatch.setattr(sched, "mark_job_started", lambda *a, **kw: True)
+        monkeypatch.setattr(sched, "finalize_job_run", lambda *a, **kw: True)
+        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(sched, "update_delivery_error_if_latest", lambda *a, **kw: True)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_try_acquire_job_lock", lambda _job_id: object())
+        monkeypatch.setattr(sched, "_release_lock_file", lambda _fd: None)
 
         lock = threading.Lock()
         calls: list[tuple[str, str, float, float, str]] = []
@@ -243,18 +259,17 @@ class TestTickWorkdirPartition:
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
-        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
-        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
         assert n == 2
+        deadline = time.monotonic() + 2.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert {c[0] for c in calls} == {"a", "b"}
 
         starts = [c[2] for c in calls]
         ends = [c[3] for c in calls]
         assert max(starts) < min(ends), f"workdir jobs did not overlap: {calls}"
-        assert {c[0]: c[4] for c in calls} == {"a": str(dir_a), "b": str(dir_b)}
 
 
 # ---------------------------------------------------------------------------

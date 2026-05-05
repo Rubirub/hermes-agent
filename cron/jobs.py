@@ -6,17 +6,20 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
 import copy
+import errno
 import json
 import logging
 import tempfile
 import threading
 import os
 import re
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,7 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+IN_FLIGHT_TIMEOUT_GRACE_SECONDS = 5
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -332,6 +336,423 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         return next_run.isoformat()
 
     return None
+
+
+def _cron_timeout_seconds() -> float:
+    """Return configured cron timeout in seconds, clamped to a sane minimum."""
+    try:
+        timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
+    except (TypeError, ValueError):
+        timeout = 600.0
+    return max(timeout, 1.0)
+
+
+def _orphan_recovery_grace_seconds() -> float:
+    """Return the orphan-recovery grace window in seconds."""
+    try:
+        value = float(os.getenv("HERMES_CRON_ORPHAN_GRACE_SECONDS", 60))
+    except (TypeError, ValueError):
+        value = 60.0
+    return max(value, 0.0)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(value))
+    except Exception:
+        return None
+
+
+def _parse_legacy_owner_pid(owner_instance_id: Optional[str]) -> Optional[int]:
+    if not owner_instance_id:
+        return None
+    match = re.match(r"^(\d+)-", str(owner_instance_id).strip())
+    if not match:
+        return None
+    try:
+        pid = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _linux_boot_id() -> Optional[str]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return value or None
+
+
+def _darwin_boot_fingerprint() -> Optional[str]:
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    output = (result.stdout or "").strip()
+    match = re.search(r"sec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)", output)
+    if match:
+        return f"{match.group(1)}.{match.group(2)}"
+    compact = re.sub(r"\s+", " ", output)
+    return compact or None
+
+
+def _boot_fingerprint() -> Optional[str]:
+    if sys.platform.startswith("linux"):
+        return _linux_boot_id()
+    if sys.platform == "darwin":
+        return _darwin_boot_fingerprint()
+    return None
+
+
+def _linux_process_state(pid: int) -> Optional[str]:
+    if not sys.platform.startswith("linux") or pid <= 0:
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    end_idx = stat_text.rfind(")")
+    if end_idx == -1 or len(stat_text) <= end_idx + 2:
+        return None
+    state = stat_text[end_idx + 2 : end_idx + 3]
+    return state or None
+
+
+def _linux_process_start_fingerprint(pid: int) -> Optional[str]:
+    if not sys.platform.startswith("linux") or pid <= 0:
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    end_idx = stat_text.rfind(")")
+    if end_idx == -1:
+        return None
+
+    fields = stat_text[end_idx + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    return fields[19] or None
+
+
+def _darwin_process_start_fingerprint(pid: int) -> Optional[str]:
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    output = re.sub(r"\s+", " ", (result.stdout or "").strip())
+    return output or None
+
+
+def _process_start_fingerprint(pid: int) -> Optional[str]:
+    if sys.platform.startswith("linux"):
+        return _linux_process_start_fingerprint(pid)
+    if sys.platform == "darwin":
+        return _darwin_process_start_fingerprint(pid)
+    return None
+
+
+def _pid_is_alive(pid: int) -> Optional[bool]:
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        alive = True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            alive = True
+        else:
+            return None
+    else:
+        alive = True
+
+    if alive and sys.platform.startswith("linux"):
+        state = _linux_process_state(pid)
+        if state in {"Z", "X", "x"}:
+            return False
+    return alive
+
+
+def _process_identity_matches(
+    pid: int,
+    *,
+    boot_id: Optional[str],
+    process_start: Optional[str],
+) -> Optional[bool]:
+    checked = False
+
+    if boot_id:
+        current_boot_id = _boot_fingerprint()
+        if not current_boot_id:
+            return None
+        checked = True
+        if current_boot_id != boot_id:
+            return False
+
+    if process_start:
+        current_process_start = _process_start_fingerprint(pid)
+        if not current_process_start:
+            return None
+        checked = True
+        if current_process_start != process_start:
+            return False
+
+    if checked and process_start:
+        return True
+    return None
+
+
+def _legacy_owner_pid_is_dead(pid: int) -> bool:
+    return _pid_is_alive(pid) is False
+
+
+def _get_inflight_owner_state(
+    in_flight: Dict[str, Any],
+    now_dt: Optional[datetime] = None,
+) -> Tuple[str, str]:
+    del now_dt
+
+    owner_pid_raw = in_flight.get("owner_pid")
+    try:
+        owner_pid = int(owner_pid_raw) if owner_pid_raw is not None else None
+    except (TypeError, ValueError):
+        owner_pid = None
+
+    if owner_pid and owner_pid > 0:
+        alive = _pid_is_alive(owner_pid)
+        if alive is False:
+            return "dead", f"owner pid {owner_pid} not alive"
+        if alive is True:
+            identity = _process_identity_matches(
+                owner_pid,
+                boot_id=in_flight.get("owner_boot_id"),
+                process_start=in_flight.get("owner_process_start"),
+            )
+            if identity is True:
+                return "alive", f"owner pid {owner_pid} alive and fingerprint matches"
+            if identity is False:
+                return "mismatch", f"owner pid {owner_pid} fingerprint mismatch"
+            return "unknown", f"owner pid {owner_pid} alive but identity could not be confirmed"
+        return "unknown", f"owner pid {owner_pid} liveness unavailable"
+
+    legacy_pid = _parse_legacy_owner_pid(in_flight.get("owner_instance_id"))
+    if legacy_pid is not None:
+        if _legacy_owner_pid_is_dead(legacy_pid):
+            return "dead", f"legacy owner pid {legacy_pid} not alive"
+        return "unknown", f"legacy owner pid {legacy_pid} could not be verified"
+
+    return "unknown", "owner metadata missing or unsupported"
+
+
+def _find_job_index(jobs: List[Dict[str, Any]], job_id: str) -> Optional[int]:
+    for i, job in enumerate(jobs):
+        if job.get("id") == job_id:
+            return i
+    return None
+
+
+def _build_jobs_index(jobs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(job.get("id")): job for job in jobs if job.get("id")}
+
+
+def _apply_run_outcome(
+    job: Dict[str, Any],
+    *,
+    success: bool,
+    error: Optional[str],
+    run_at: str,
+    recompute_next_run: bool,
+    delivery_error: Optional[str] = None,
+) -> bool:
+    """Apply run outcome to a job in-place.
+
+    Returns True when the job should be removed because a repeat limit was hit.
+    """
+    was_paused = job.get("state") == "paused" or not job.get("enabled", True)
+
+    job["last_run_at"] = run_at
+    job["last_status"] = "ok" if success else "error"
+    job["last_error"] = None if success else error
+    job["last_delivery_error"] = delivery_error
+
+    if job.get("repeat"):
+        job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+        times = job["repeat"].get("times")
+        completed = job["repeat"]["completed"]
+        if times is not None and times > 0 and completed >= times:
+            return True
+
+    schedule = job.get("schedule", {})
+    kind = schedule.get("kind")
+    if recompute_next_run:
+        next_run = compute_next_run(schedule, run_at)
+    elif kind == "once":
+        next_run = None
+    else:
+        next_run = job.get("next_run_at") or compute_next_run(schedule, run_at)
+
+    job["next_run_at"] = next_run
+    if was_paused:
+        job["enabled"] = False
+        job["state"] = "paused"
+    elif next_run is None:
+        if kind in ("cron", "interval"):
+            job["enabled"] = True
+            job["state"] = "error"
+            if not job.get("last_error"):
+                job["last_error"] = (
+                    "Failed to compute next run for recurring schedule "
+                    "(is the 'croniter' package installed in the gateway's Python env?)"
+                )
+            logger.error(
+                "Job '%s' (%s) could not compute next_run_at; leaving enabled and marking state=error",
+                job.get("name", job.get("id")),
+                kind,
+            )
+        else:
+            job["enabled"] = False
+            job["state"] = "completed"
+    else:
+        job["state"] = "scheduled"
+
+    return False
+
+
+def _restore_recoverable_next_run(job: Dict[str, Any], in_flight: Dict[str, Any], *, now_iso: str) -> None:
+    """Undo claim-time recurring schedule advancement so recovery can requeue the job."""
+    kind = job.get("schedule", {}).get("kind")
+    if kind not in ("cron", "interval"):
+        return
+
+    claimed_at = in_flight.get("claimed_at")
+    recovered_due = claimed_at if _parse_iso_datetime(claimed_at) else now_iso
+    job["next_run_at"] = recovered_due
+
+
+def _collect_due_jobs(
+    raw_jobs: List[Dict[str, Any]],
+    now: datetime,
+    *,
+    skip_in_flight: bool = True,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Collect due jobs from raw storage records."""
+    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    due: List[Dict[str, Any]] = []
+    needs_save = False
+    raw_by_id = _build_jobs_index(raw_jobs)
+
+    for job in jobs:
+        manual_trigger_at = job.get("trigger_once_at")
+        manual_trigger_dt = _parse_iso_datetime(manual_trigger_at) if manual_trigger_at else None
+        manual_trigger_due = manual_trigger_dt is not None and manual_trigger_dt <= now
+
+        if not job.get("enabled", True) and not manual_trigger_due:
+            continue
+        if skip_in_flight and job.get("in_flight"):
+            continue
+
+        if manual_trigger_due:
+            raw = raw_by_id.get(job["id"])
+            if raw is not None:
+                raw["trigger_once_at"] = None
+                needs_save = True
+            job["trigger_once_at"] = None
+            due.append(job)
+            continue
+
+        next_run = job.get("next_run_at")
+        if not next_run:
+            schedule = job.get("schedule", {})
+            kind = schedule.get("kind")
+            recovered_next = _recoverable_oneshot_run_at(
+                schedule,
+                now,
+                last_run_at=job.get("last_run_at"),
+            )
+            recovery_kind = "one-shot" if recovered_next else None
+            if not recovered_next and kind in ("cron", "interval"):
+                recovered_next = compute_next_run(schedule, now.isoformat())
+                if recovered_next:
+                    recovery_kind = kind
+            if not recovered_next:
+                continue
+
+            job["next_run_at"] = recovered_next
+            next_run = recovered_next
+            logger.info(
+                "Job '%s' had no next_run_at; recovering %s run at %s",
+                job.get("name", job["id"]),
+                recovery_kind,
+                recovered_next,
+            )
+            raw = raw_by_id.get(job["id"])
+            if raw is not None:
+                raw["next_run_at"] = recovered_next
+                needs_save = True
+
+        next_run_dt = _parse_iso_datetime(next_run)
+        if not next_run_dt:
+            continue
+
+        if next_run_dt <= now:
+            schedule = job.get("schedule", {})
+            kind = schedule.get("kind")
+
+            grace = _compute_grace_seconds(schedule)
+            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                new_next = compute_next_run(schedule, now.isoformat())
+                if new_next:
+                    logger.info(
+                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                        "Fast-forwarding to next run: %s",
+                        job.get("name", job["id"]),
+                        next_run,
+                        grace,
+                        new_next,
+                    )
+                    raw = raw_by_id.get(job["id"])
+                    if raw is not None:
+                        raw["next_run_at"] = new_next
+                        needs_save = True
+                    continue
+
+            due.append(job)
+
+    return due, needs_save
 
 
 # =============================================================================
@@ -673,18 +1094,14 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick."""
+    """Trigger exactly one run on the next scheduler tick without changing pause/resume state."""
     job = get_job(job_id)
     if not job:
         return None
     return update_job(
         job_id,
         {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "trigger_once_at": _hermes_now().isoformat(),
         },
     )
 
@@ -700,6 +1117,326 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def recover_stale_inflight(now: Optional[datetime] = None) -> int:
+    """Recover timed-out or clearly orphaned in-flight runs.
+
+    Recovery is intentionally recorded as a failed run attempt: it clears the
+    in-flight claim, stores an error status, and increments repeat accounting.
+    This is conservative for operators because a claimed job may have performed
+    partial side effects before the owner wedged or disappeared.
+    """
+    now_dt = now or _hermes_now()
+    now_iso = now_dt.isoformat()
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        recovered = 0
+        needs_save = False
+
+        for idx in range(len(jobs) - 1, -1, -1):
+            job = jobs[idx]
+            in_flight = job.get("in_flight")
+            if not isinstance(in_flight, dict):
+                continue
+
+            timeout_dt = _parse_iso_datetime(in_flight.get("timeout_at"))
+            run_id = in_flight.get("run_id", "unknown")
+            claimed_at_dt = _parse_iso_datetime(in_flight.get("claimed_at"))
+            grace_seconds = _orphan_recovery_grace_seconds()
+            within_grace = (
+                claimed_at_dt is not None
+                and (now_dt - claimed_at_dt).total_seconds() < grace_seconds
+            )
+
+            reason: Optional[str] = None
+            log_message: Optional[str] = None
+            owner_state = "unknown"
+            owner_reason = "owner state not evaluated"
+
+            if timeout_dt is None:
+                owner_state, owner_reason = _get_inflight_owner_state(in_flight, now_dt=now_dt)
+                if owner_state in ("dead", "mismatch") and not within_grace:
+                    reason = f"orphan_recovered: {owner_reason}; run_id={run_id}"
+                    log_message = "Recovering malformed orphaned in-flight run for job '%s' (run_id=%s): %s"
+                elif owner_state == "alive":
+                    logger.warning(
+                        "Keeping malformed in-flight owner for job '%s' (run_id=%s): %s",
+                        job.get("id"),
+                        run_id,
+                        owner_reason,
+                    )
+                elif owner_state == "unknown":
+                    malformed_age_seconds = None
+                    if claimed_at_dt is not None:
+                        malformed_age_seconds = (now_dt - claimed_at_dt).total_seconds()
+                    malformed_stale = (
+                        claimed_at_dt is None
+                        or malformed_age_seconds is None
+                        or malformed_age_seconds >= (_cron_timeout_seconds() + grace_seconds)
+                    )
+                    if malformed_stale:
+                        reason = f"stale_recovered: invalid_timeout_at; run_id={run_id}"
+                        log_message = "Recovering malformed in-flight run for job '%s' (run_id=%s): missing/invalid timeout_at"
+                    else:
+                        logger.warning(
+                            "Deferring malformed in-flight recovery for job '%s' (run_id=%s): %s",
+                            job.get("id"),
+                            run_id,
+                            owner_reason,
+                        )
+                elif within_grace:
+                    logger.debug(
+                        "Malformed owner for job '%s' (run_id=%s) appears %s but remains within grace window",
+                        job.get("id"),
+                        run_id,
+                        owner_state,
+                    )
+            elif timeout_dt <= now_dt:
+                reason = f"stale_recovered: run_id={run_id}"
+                log_message = "Recovering timed-out in-flight run for job '%s' (run_id=%s)"
+            else:
+                owner_state, owner_reason = _get_inflight_owner_state(in_flight, now_dt=now_dt)
+                if owner_state in ("dead", "mismatch") and not within_grace:
+                    reason = f"orphan_recovered: {owner_reason}; run_id={run_id}"
+                    log_message = "Recovering orphaned in-flight run for job '%s' (run_id=%s): %s"
+                elif owner_state == "unknown":
+                    logger.debug(
+                        "Deferring early recovery for job '%s' (run_id=%s): %s",
+                        job.get("id"),
+                        run_id,
+                        owner_reason,
+                    )
+                elif owner_state == "alive":
+                    logger.debug(
+                        "Keeping live in-flight owner for job '%s' (run_id=%s): %s",
+                        job.get("id"),
+                        run_id,
+                        owner_reason,
+                    )
+                elif within_grace:
+                    logger.debug(
+                        "Owner for job '%s' (run_id=%s) appears %s but remains within grace window",
+                        job.get("id"),
+                        run_id,
+                        owner_state,
+                    )
+
+            if reason is None:
+                continue
+
+            if log_message:
+                if log_message.count("%s") >= 3:
+                    logger.warning(log_message, job.get("id"), run_id, reason)
+                else:
+                    logger.warning(log_message, job.get("id"), run_id)
+
+            _restore_recoverable_next_run(job, in_flight, now_iso=now_iso)
+            should_remove = _apply_run_outcome(
+                job,
+                success=False,
+                error=reason,
+                run_at=now_iso,
+                recompute_next_run=False,
+                delivery_error=None,
+            )
+            job["in_flight"] = None
+
+            if should_remove:
+                jobs.pop(idx)
+            else:
+                jobs[idx] = job
+
+            recovered += 1
+            needs_save = True
+
+        if needs_save:
+            save_jobs(jobs)
+
+        return recovered
+
+
+def claim_due_jobs(
+    now: Optional[datetime] = None,
+    owner_instance_id: str = "",
+    max_parallel: int = 1,
+    owner_pid: Optional[int] = None,
+    owner_boot_id: Optional[str] = None,
+    owner_process_start: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Claim due jobs by writing durable in-flight ownership metadata."""
+    now_dt = now or _hermes_now()
+    now_iso = now_dt.isoformat()
+
+    with _jobs_file_lock:
+        raw_jobs = load_jobs()
+        due_jobs, needs_save = _collect_due_jobs(raw_jobs, now_dt, skip_in_flight=True)
+        claimed: List[Dict[str, Any]] = []
+        raw_by_id = _build_jobs_index(raw_jobs)
+
+        try:
+            claim_budget = max(0, int(max_parallel))
+        except (TypeError, ValueError):
+            claim_budget = 1
+
+        if claim_budget <= 0:
+            if needs_save:
+                save_jobs(raw_jobs)
+            return []
+
+        claim_owner_pid = owner_pid if owner_pid is not None else os.getpid()
+        if claim_owner_pid is not None and claim_owner_pid <= 0:
+            claim_owner_pid = None
+        claim_owner_boot_id = owner_boot_id if owner_boot_id is not None else _boot_fingerprint()
+        claim_owner_process_start = owner_process_start
+        if claim_owner_process_start is None and claim_owner_pid is not None:
+            claim_owner_process_start = _process_start_fingerprint(claim_owner_pid)
+
+        timeout_at = (
+            now_dt
+            + timedelta(seconds=_cron_timeout_seconds() + IN_FLIGHT_TIMEOUT_GRACE_SECONDS)
+        ).isoformat()
+
+        for due in due_jobs:
+            if len(claimed) >= claim_budget:
+                break
+            raw = raw_by_id.get(due["id"])
+            if raw is None or raw.get("in_flight"):
+                continue
+
+            run_id = uuid.uuid4().hex
+            raw["in_flight"] = {
+                "run_id": run_id,
+                "owner_instance_id": owner_instance_id,
+                "owner_pid": claim_owner_pid,
+                "owner_boot_id": claim_owner_boot_id,
+                "owner_process_start": claim_owner_process_start,
+                "claimed_at": now_iso,
+                "timeout_at": timeout_at,
+                "started_at": None,
+                "status": "claimed",
+            }
+
+            kind = raw.get("schedule", {}).get("kind")
+            if kind in ("cron", "interval"):
+                advanced_next = compute_next_run(raw["schedule"], now_iso)
+                if advanced_next:
+                    raw["next_run_at"] = advanced_next
+
+            claimed.append(_apply_skill_fields(copy.deepcopy(raw)))
+            needs_save = True
+
+        if needs_save:
+            save_jobs(raw_jobs)
+
+        return claimed
+
+
+def mark_job_started(job_id: str, run_id: str, started_at: Optional[str] = None) -> bool:
+    """Mark an owned in-flight run as actively running."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        idx = _find_job_index(jobs, job_id)
+        if idx is None:
+            return False
+
+        job = jobs[idx]
+        in_flight = job.get("in_flight")
+        if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+            return False
+
+        in_flight["started_at"] = started_at or _hermes_now().isoformat()
+        in_flight["status"] = "running"
+        job["in_flight"] = in_flight
+        save_jobs(jobs)
+        return True
+
+
+def clear_inflight_if_owned(job_id: str, run_id: str, reason: Optional[str] = None) -> bool:
+    """Clear in_flight only when the provided run_id still owns the claim."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        idx = _find_job_index(jobs, job_id)
+        if idx is None:
+            return False
+
+        job = jobs[idx]
+        in_flight = job.get("in_flight")
+        if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+            return False
+
+        job["in_flight"] = None
+        if reason:
+            now_iso = _hermes_now().isoformat()
+            job["last_run_at"] = now_iso
+            job["last_status"] = "error"
+            job["last_error"] = reason
+            job["last_delivery_error"] = None
+            if job.get("schedule", {}).get("kind") == "once":
+                job["next_run_at"] = None
+                job["enabled"] = False
+                if job.get("state") != "paused":
+                    job["state"] = "completed"
+
+        save_jobs(jobs)
+        return True
+
+
+def finalize_job_run(
+    job_id: str,
+    run_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    finished_at: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+) -> bool:
+    """Finalize a run only when run_id still matches the stored owner."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        idx = _find_job_index(jobs, job_id)
+        if idx is None:
+            return False
+
+        job = jobs[idx]
+        in_flight = job.get("in_flight")
+        if not isinstance(in_flight, dict) or in_flight.get("run_id") != run_id:
+            return False
+
+        run_at = finished_at or _hermes_now().isoformat()
+        should_remove = _apply_run_outcome(
+            job,
+            success=success,
+            error=error,
+            run_at=run_at,
+            recompute_next_run=False,
+            delivery_error=delivery_error,
+        )
+        job["in_flight"] = None
+
+        if should_remove:
+            jobs.pop(idx)
+        else:
+            jobs[idx] = job
+        save_jobs(jobs)
+        return True
+
+
+def update_delivery_error_if_latest(job_id: str, run_at: str, delivery_error: Optional[str]) -> bool:
+    """Update delivery status only if the recorded run still matches ``run_at``."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        idx = _find_job_index(jobs, job_id)
+        if idx is None:
+            return False
+
+        job = jobs[idx]
+        if job.get("last_run_at") != run_at:
+            return False
+
+        job["last_delivery_error"] = delivery_error
+        jobs[idx] = job
+        save_jobs(jobs)
+        return True
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
@@ -713,64 +1450,27 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     """
     with _jobs_file_lock:
         jobs = load_jobs()
-        for i, job in enumerate(jobs):
-            if job["id"] == job_id:
-                now = _hermes_now().isoformat()
-                job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
-                # Track delivery failures separately — cleared on successful delivery
-                job["last_delivery_error"] = delivery_error
-                
-                # Increment completed count
-                if job.get("repeat"):
-                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                    
-                    # Check if we've hit the repeat limit
-                    times = job["repeat"].get("times")
-                    completed = job["repeat"]["completed"]
-                    if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
-                        save_jobs(jobs)
-                        return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+        idx = _find_job_index(jobs, job_id)
+        if idx is None:
+            logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+            return
 
-                # If no next run, decide whether this is terminal completion
-                # (one-shot) or a transient failure (recurring schedule couldn't
-                # compute — e.g. 'croniter' missing from the runtime env).
-                # Recurring jobs must NEVER be silently disabled: that turns a
-                # missing runtime dep into "job completed" and the user's
-                # schedule quietly goes off. See issue #16265.
-                if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
-                    if kind in ("cron", "interval"):
-                        job["state"] = "error"
-                        if not job.get("last_error"):
-                            job["last_error"] = (
-                                "Failed to compute next run for recurring "
-                                "schedule (is the 'croniter' package "
-                                "installed in the gateway's Python env?)"
-                            )
-                        logger.error(
-                            "Job '%s' (%s) could not compute next_run_at; "
-                            "leaving enabled and marking state=error so the "
-                            "job is not silently disabled.",
-                            job.get("name", job["id"]),
-                            kind,
-                        )
-                    else:
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                elif job.get("state") != "paused":
-                    job["state"] = "scheduled"
+        job = jobs[idx]
+        run_at = _hermes_now().isoformat()
+        should_remove = _apply_run_outcome(
+            job,
+            success=success,
+            error=error,
+            run_at=run_at,
+            recompute_next_run=True,
+            delivery_error=delivery_error,
+        )
 
-                save_jobs(jobs)
-                return
-
-        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        if should_remove:
+            jobs.pop(idx)
+        else:
+            jobs[idx] = job
+        save_jobs(jobs)
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -811,97 +1511,12 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     immediately.  This prevents a burst of missed jobs on gateway restart.
     """
     with _jobs_file_lock:
-        return _get_due_jobs_locked()
-
-
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
-    """Inner implementation of get_due_jobs(); must be called with _jobs_file_lock held."""
-    now = _hermes_now()
-    raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
-    needs_save = False
-
-    for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
-
-            # One-shot jobs use a small grace window via the dedicated helper.
-            recovered_next = _recoverable_oneshot_run_at(
-                schedule,
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            recovery_kind = "one-shot" if recovered_next else None
-
-            # Recurring jobs reach here only when something — typically a
-            # direct jobs.json edit that bypassed add_job() — left
-            # next_run_at unset.  Without this branch, such jobs are
-            # silently skipped forever; recompute next_run_at from the
-            # schedule so they pick up at their next scheduled tick.
-            if not recovered_next and kind in ("cron", "interval"):
-                recovered_next = compute_next_run(schedule, now.isoformat())
-                if recovered_next:
-                    recovery_kind = kind
-
-            if not recovered_next:
-                continue
-
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering %s run at %s",
-                job.get("name", job["id"]),
-                recovery_kind,
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
-
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
-
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
-
-            due.append(job)
-
-    if needs_save:
-        save_jobs(raw_jobs)
-
-    return due
+        now = _hermes_now()
+        raw_jobs = load_jobs()
+        due, needs_save = _collect_due_jobs(raw_jobs, now, skip_in_flight=True)
+        if needs_save:
+            save_jobs(raw_jobs)
+        return due
 
 
 def save_job_output(job_id: str, output: str):
