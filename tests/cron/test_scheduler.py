@@ -1174,6 +1174,116 @@ class TestRunJobSessionPersistence:
 
         (tmp_path / ".env").write_text("TELEGRAM_HOME_CHANNEL=-2002\n")
         monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None
+                seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None
+                seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        assert seen == {
+            "platform": "telegram",
+            "chat_id": "-2002",
+            "thread_id": None,
+        }
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
+
+    def test_run_job_tolerates_missing_auto_delivery_contextvars_after_hot_upgrade(self, tmp_path, monkeypatch):
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "hello",
+            "deliver": "telegram",
+        }
+        fake_db = MagicMock()
+        seen = {}
+
+        (tmp_path / ".env").write_text("TELEGRAM_HOME_CHANNEL=-2002\n")
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+
+        from gateway import session_context
+
+        removed = {}
+        for name in (
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        ):
+            removed[name] = session_context._VAR_MAP.pop(name)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None
+                seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None
+                seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
+                return {"final_response": "ok"}
+
+        try:
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("hermes_state.SessionDB", return_value=fake_db), \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value={
+                         "api_key": "***",
+                         "base_url": "https://example.invalid/v1",
+                         "provider": "openrouter",
+                         "api_mode": "chat_completions",
+                     },
+                 ), \
+                 patch("run_agent.AIAgent", FakeAgent):
+                success, output, final_response, error = run_job(job)
+        finally:
+            session_context._VAR_MAP.update(removed)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        assert seen == {
+            "platform": "telegram",
+            "chat_id": "-2002",
+            "thread_id": None,
+        }
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
 
 
 
