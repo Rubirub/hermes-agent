@@ -199,49 +199,62 @@ class TestCronjobToolWorkdir:
 
 class TestTickWorkdirPartition:
     """
-    tick() must run workdir jobs sequentially (outside the ThreadPoolExecutor)
-    because run_job mutates os.environ["TERMINAL_CWD"], which is process-global.
-    We verify the partition without booting the real scheduler by patching the
-    pieces tick() calls.
+    tick() should run workdir jobs in parallel while keeping each job's
+    TERMINAL_CWD isolated from sibling cron jobs.
     """
 
-    def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
+    def test_workdir_jobs_run_concurrently_with_isolated_terminal_cwd(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
         import cron.scheduler as sched
+        from hermes_cli.cwd_context import get_terminal_cwd
 
-        # Two "jobs" — one with workdir, one without.  get_due_jobs returns both.
-        workdir_job = {"id": "a", "name": "A", "workdir": str(tmp_path)}
-        parallel_job = {"id": "b", "name": "B", "workdir": None}
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        jobs = [
+            {"id": "a", "name": "A", "workdir": str(dir_a)},
+            {"id": "b", "name": "B", "workdir": str(dir_b)},
+        ]
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_job, parallel_job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
-        # Record call order / thread context.
-        import threading
-        calls: list[tuple[str, bool]] = []
+        lock = threading.Lock()
+        calls: list[tuple[str, str, float, float, str]] = []
+        both_started = threading.Event()
+        started = 0
 
         def fake_run_job(job):
-            # Return a minimal tuple matching run_job's signature.
-            calls.append((job["id"], threading.current_thread().name))
+            nonlocal started
+            start = time.monotonic()
+            cwd = get_terminal_cwd()
+            with lock:
+                started += 1
+                if started == 2:
+                    both_started.set()
+            assert both_started.wait(1.0), "second workdir job never started concurrently"
+            time.sleep(0.05)
+            end = time.monotonic()
+            with lock:
+                calls.append((job["id"], threading.current_thread().name, start, end, cwd))
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
         monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(
-            sched, "_deliver_result", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
         assert n == 2
+        assert {c[0] for c in calls} == {"a", "b"}
 
-        ids = [c[0] for c in calls]
-        # Workdir jobs always come before parallel jobs.
-        assert ids.index("a") < ids.index("b")
-
-        # The workdir job must run on the main thread (sequential pass).
-        main_thread_name = threading.current_thread().name
-        workdir_thread_name = next(t for jid, t in calls if jid == "a")
-        assert workdir_thread_name == main_thread_name
+        starts = [c[2] for c in calls]
+        ends = [c[3] for c in calls]
+        assert max(starts) < min(ends), f"workdir jobs did not overlap: {calls}"
+        assert {c[0]: c[4] for c in calls} == {"a": str(dir_a), "b": str(dir_b)}
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +275,16 @@ class TestRunJobTerminalCwd:
         import sys
         import cron.scheduler as sched
 
+        from hermes_cli.cwd_context import get_terminal_cwd
+
         class FakeAgent:
             def __init__(self, **kwargs):
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
                 observed["load_soul_identity"] = kwargs.get("load_soul_identity")
-                observed["terminal_cwd_during_init"] = os.environ.get(
-                    "TERMINAL_CWD", "_UNSET_"
-                )
+                observed["terminal_cwd_during_init"] = get_terminal_cwd("_UNSET_")
 
             def run_conversation(self, *_a, **_kw):
-                observed["terminal_cwd_during_run"] = os.environ.get(
-                    "TERMINAL_CWD", "_UNSET_"
-                )
+                observed["terminal_cwd_during_run"] = get_terminal_cwd("_UNSET_")
                 return {"final_response": "done", "messages": []}
 
             def get_activity_summary(self):

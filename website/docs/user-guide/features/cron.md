@@ -117,8 +117,8 @@ When `workdir` is set:
 - The path must be an absolute directory that exists — relative paths and missing directories are rejected at create / update time
 - Pass `--workdir ""` (or `workdir=""` via the tool) on edit to clear it and restore the old behaviour
 
-:::note Serialization
-Jobs with a `workdir` run sequentially on the scheduler tick, not in the parallel pool. This is deliberate — `TERMINAL_CWD` is process-global, so two workdir jobs running at the same time would corrupt each other's cwd. Workdir-less jobs still run in parallel as before.
+:::note Parallel workdirs
+Jobs with a `workdir` run in the same parallel scheduler pool as other cron jobs. Hermes keeps each job's tool cwd isolated with a context-local `TERMINAL_CWD` value, so concurrent workdir jobs do not clobber each other's project directory.
 :::
 
 ## Editing jobs

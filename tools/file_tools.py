@@ -8,6 +8,8 @@ import os
 import threading
 from pathlib import Path
 
+from hermes_cli.cwd_context import get_terminal_cwd
+
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
@@ -120,9 +122,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
-            "TERMINAL_CWD", os.getcwd()
-        )
+        base = _get_live_tracking_cwd(task_id) or get_terminal_cwd(os.getcwd())
         p = Path(base) / p
     return p.resolve()
 
