@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,101 @@ def _raise_stream_error(event: Any) -> None:
         message,
         code=_event_field(event, "code"),
         param=_event_field(event, "param"),
+    )
+
+
+def _raw_codex_event_stream(agent: Any, api_kwargs: dict) -> Any:
+    """Yield raw Responses SSE events for Codex without OpenAI SDK parsing.
+
+    ``openai.Stream`` still parses every SSE frame into SDK event models.  When
+    the ChatGPT Codex backend drifts and sends ``response.output: null`` on the
+    terminal frame, that parsing layer can raise before our event consumer sees
+    the frame.  This reader keeps the existing request shape but parses only the
+    SSE envelope and JSON payload, leaving content normalization to
+    ``_consume_codex_event_stream``.
+    """
+    import httpx
+
+    base_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
+    if not base_url:
+        client_kwargs = getattr(agent, "_client_kwargs", {}) or {}
+        base_url = str(client_kwargs.get("base_url", "") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("Codex raw stream fallback could not determine base_url")
+
+    api_key = str(getattr(agent, "api_key", "") or "")
+    if not api_key:
+        client_kwargs = getattr(agent, "_client_kwargs", {}) or {}
+        api_key = str(client_kwargs.get("api_key", "") or "")
+    if not api_key:
+        raise RuntimeError("Codex raw stream fallback could not determine api_key")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    try:
+        from agent.auxiliary_client import _codex_cloudflare_headers
+        headers.update(_codex_cloudflare_headers(api_key))
+    except Exception:
+        pass
+
+    timeout = None
+    client_kwargs = getattr(agent, "_client_kwargs", {}) or {}
+    configured_timeout = client_kwargs.get("timeout")
+    if isinstance(configured_timeout, (int, float)) and configured_timeout > 0:
+        timeout = httpx.Timeout(float(configured_timeout), read=None)
+
+    payload = dict(api_kwargs)
+    payload["stream"] = True
+    url = f"{base_url}/responses"
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", url, headers=headers, json=payload) as response:
+            response.raise_for_status()
+            event_name = None
+            data_lines: List[str] = []
+
+            def emit_event() -> Optional[dict]:
+                nonlocal event_name, data_lines
+                if not data_lines:
+                    event_name = None
+                    return None
+                raw_data = "\n".join(data_lines)
+                current_event_name = event_name
+                event_name = None
+                data_lines = []
+                if not raw_data or raw_data == "[DONE]":
+                    return None
+                parsed = json.loads(raw_data)
+                if isinstance(parsed, dict):
+                    parsed.setdefault("type", current_event_name or parsed.get("type"))
+                    return parsed
+                return {"type": current_event_name or "", "data": parsed}
+
+            for line in response.iter_lines():
+                if line == "":
+                    event = emit_event()
+                    if event is not None:
+                        yield event
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[len("event:"):].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].lstrip())
+
+            event = emit_event()
+            if event is not None:
+                yield event
+
+
+def _is_null_output_stream_parser_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, TypeError)
+        and "'NoneType' object is not iterable" in str(exc)
     )
 
 
@@ -477,15 +572,34 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 return event_stream
 
             try:
-                final = _consume_codex_event_stream(
-                    event_stream,
-                    model=api_kwargs.get("model"),
-                    on_text_delta=_on_text_delta,
-                    on_reasoning_delta=_on_reasoning_delta,
-                    on_first_delta=on_first_delta,
-                    on_event=_on_event,
-                    interrupt_check=_interrupt_check,
-                )
+                try:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=api_kwargs.get("model"),
+                        on_text_delta=_on_text_delta,
+                        on_reasoning_delta=_on_reasoning_delta,
+                        on_first_delta=on_first_delta,
+                        on_event=_on_event,
+                        interrupt_check=_interrupt_check,
+                    )
+                except TypeError as exc:
+                    if not _is_null_output_stream_parser_error(exc):
+                        raise
+                    logger.warning(
+                        "OpenAI SDK Codex stream parser hit null response.output; "
+                        "retrying with raw SSE reader. %s",
+                        agent._client_log_context(),
+                    )
+                    agent._codex_streamed_text_parts = []
+                    final = _consume_codex_event_stream(
+                        _raw_codex_event_stream(agent, api_kwargs),
+                        model=api_kwargs.get("model"),
+                        on_text_delta=_on_text_delta,
+                        on_reasoning_delta=_on_reasoning_delta,
+                        on_first_delta=on_first_delta,
+                        on_event=_on_event,
+                        interrupt_check=_interrupt_check,
+                    )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(

@@ -531,6 +531,62 @@ def test_run_codex_stream_ignores_completed_response_with_null_output(monkeypatc
     assert response.usage.total_tokens == 11
 
 
+def test_run_codex_stream_retries_with_raw_sse_when_sdk_parser_hits_null_output(monkeypatch):
+    """The SDK stream parser can raise before yielding the terminal null-output frame."""
+    from agent import codex_runtime
+
+    agent = _build_agent(monkeypatch)
+    output_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="raw retry ok")],
+    )
+    calls = {"create": 0, "raw": 0}
+
+    class _ParserCrashStream:
+        closed = False
+
+        def __iter__(self):
+            raise TypeError("'NoneType' object is not iterable")
+
+        def close(self):
+            self.closed = True
+
+    crashing_stream = _ParserCrashStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return crashing_stream
+
+    def _fake_raw_stream(_agent, kwargs):
+        calls["raw"] += 1
+        assert kwargs.get("stream") is not True
+        yield {"type": "response.output_item.done", "item": output_item}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_raw_retry",
+                "status": "completed",
+                "output": None,
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            },
+        }
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=_fake_create),
+    )
+    monkeypatch.setattr(codex_runtime, "_raw_codex_event_stream", _fake_raw_stream)
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"create": 1, "raw": 1}
+    assert crashing_stream.closed is True
+    assert response.id == "resp_raw_retry"
+    assert response.status == "completed"
+    assert response.output == [output_item]
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))
